@@ -57,21 +57,19 @@ defmodule FaissEx.Index do
   @doc """
   Adds vectors to the index.
 
-  Accepts an Nx tensor, a flat list of floats (single vector), or a list of lists.
+  Accepts a flat list of floats (single vector) or a list of lists (batch).
 
   ## Examples
 
-      :ok = FaissEx.Index.add(index, Nx.tensor([[1.0, 2.0, 3.0]], type: {:f, 32}))
       :ok = FaissEx.Index.add(index, [1.0, 2.0, 3.0])
       :ok = FaissEx.Index.add(index, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
   """
-  def add(%__MODULE__{ref: ref, dim: dim}, data) do
-    tensor = data |> to_tensor() |> Nx.as_type({:f, 32}) |> ensure_2d(dim)
-    Shared.validate_type!(tensor, {:f, 32})
-    {n, ^dim} = Nx.shape(tensor)
-    data = Nx.to_binary(tensor)
+  def add(%__MODULE__{ref: ref, dim: dim}, data) when is_list(data) do
+    {n, flat} = Shared.to_flat_floats(data)
+    validate_length!(flat, n * dim, dim)
+    bin = Shared.floats_to_binary(flat)
 
-    case NIF.nif_add_to_index(ref, n, data) do
+    case NIF.nif_add_to_index(ref, n, bin) do
       :ok -> :ok
       {:error, _} = err -> err
     end
@@ -80,23 +78,18 @@ defmodule FaissEx.Index do
   @doc """
   Adds vectors with explicit IDs.
 
-  `ids` can be an `{:s, 64}` tensor or a list of integers.
-
   ## Examples
 
       :ok = FaissEx.Index.add_with_ids(index, [[1.0, 2.0]], [100])
   """
-  def add_with_ids(%__MODULE__{ref: ref, dim: dim} = _index, data, ids) do
-    tensor = data |> to_tensor() |> Nx.as_type({:f, 32}) |> ensure_2d(dim)
-    Shared.validate_type!(tensor, {:f, 32})
-    ids = ids |> to_tensor() |> Nx.as_type({:s, 64})
-    Shared.validate_type!(ids, {:s, 64})
+  def add_with_ids(%__MODULE__{ref: ref, dim: dim}, data, ids)
+      when is_list(data) and is_list(ids) do
+    {n, flat} = Shared.to_flat_floats(data)
+    validate_length!(flat, n * dim, dim)
+    data_bin = Shared.floats_to_binary(flat)
+    ids_bin = Shared.int64s_to_binary(ids)
 
-    {n, ^dim} = Nx.shape(tensor)
-    data = Nx.to_binary(tensor)
-    ids_bin = Nx.to_binary(ids)
-
-    case NIF.nif_add_with_ids_to_index(ref, n, data, ids_bin) do
+    case NIF.nif_add_with_ids_to_index(ref, n, data_bin, ids_bin) do
       :ok -> :ok
       {:error, _} = err -> err
     end
@@ -105,20 +98,17 @@ defmodule FaissEx.Index do
   @doc """
   Searches the index for the `k` nearest neighbors.
 
-  Returns `%{distances: tensor, labels: tensor}` where:
-    * `distances` has shape `{n, k}` and type `{:f, 32}`
-    * `labels` has shape `{n, k}` and type `{:s, 64}`
+  Returns `{:ok, %{distances: [[float]], labels: [[integer]]}}`.
   """
-  def search(%__MODULE__{ref: ref, dim: dim}, data, k) do
-    tensor = data |> to_tensor() |> Nx.as_type({:f, 32}) |> ensure_2d(dim)
-    Shared.validate_type!(tensor, {:f, 32})
-    {n, ^dim} = Nx.shape(tensor)
-    data = Nx.to_binary(tensor)
+  def search(%__MODULE__{ref: ref, dim: dim}, data, k) when is_list(data) do
+    {n, flat} = Shared.to_flat_floats(data)
+    validate_length!(flat, n * dim, dim)
+    data_bin = Shared.floats_to_binary(flat)
 
-    case NIF.nif_search_index(ref, n, data, k) do
+    case NIF.nif_search_index(ref, n, data_bin, k) do
       {:ok, {distances_bin, labels_bin}} ->
-        distances = distances_bin |> Nx.from_binary({:f, 32}) |> Nx.reshape({n, k})
-        labels = labels_bin |> Nx.from_binary({:s, 64}) |> Nx.reshape({n, k})
+        distances = distances_bin |> Shared.binary_to_floats() |> Enum.chunk_every(k)
+        labels = labels_bin |> Shared.binary_to_int64s() |> Enum.chunk_every(k)
         {:ok, %{distances: distances, labels: labels}}
 
       {:error, _} = err ->
@@ -129,13 +119,12 @@ defmodule FaissEx.Index do
   @doc """
   Trains the index (required for IVF, PQ, etc.).
   """
-  def train(%__MODULE__{ref: ref, dim: dim} = _index, data) do
-    tensor = data |> to_tensor() |> Nx.as_type({:f, 32}) |> ensure_2d(dim)
-    Shared.validate_type!(tensor, {:f, 32})
-    {n, ^dim} = Nx.shape(tensor)
-    data = Nx.to_binary(tensor)
+  def train(%__MODULE__{ref: ref, dim: dim}, data) when is_list(data) do
+    {n, flat} = Shared.to_flat_floats(data)
+    validate_length!(flat, n * dim, dim)
+    bin = Shared.floats_to_binary(flat)
 
-    case NIF.nif_train_index(ref, n, data) do
+    case NIF.nif_train_index(ref, n, bin) do
       :ok -> :ok
       {:error, _} = err -> err
     end
@@ -167,19 +156,16 @@ defmodule FaissEx.Index do
   @doc """
   Reconstructs vectors at the given keys.
 
-  `keys` is an `{:s, 64}` tensor of indices.
-  Returns an `{:f, 32}` tensor of shape `{n, dim}`.
+  `keys` is a list of integer indices.
+  Returns `{:ok, [[float]]}` with shape n * dim.
   """
-  def reconstruct(%__MODULE__{ref: ref, dim: dim}, keys) do
-    keys = keys |> to_tensor() |> Nx.as_type({:s, 64})
-    Shared.validate_type!(keys, {:s, 64})
-    keys_flat = Nx.reshape(keys, {Nx.size(keys)})
-    n = Nx.size(keys_flat)
-    keys_bin = Nx.to_binary(keys_flat)
+  def reconstruct(%__MODULE__{ref: ref, dim: dim}, keys) when is_list(keys) do
+    n = length(keys)
+    keys_bin = Shared.int64s_to_binary(keys)
 
     case NIF.nif_reconstruct_batch(ref, n, keys_bin) do
       {:ok, result_bin} ->
-        {:ok, result_bin |> Nx.from_binary({:f, 32}) |> Nx.reshape({n, dim})}
+        {:ok, result_bin |> Shared.binary_to_floats() |> Enum.chunk_every(dim)}
 
       {:error, _} = err ->
         err
@@ -188,20 +174,19 @@ defmodule FaissEx.Index do
 
   @doc """
   Computes residuals: `xs - reconstruct(keys)`.
+
+  Returns `{:ok, [[float]]}`.
   """
-  def compute_residuals(%__MODULE__{ref: ref, dim: dim}, xs, keys) do
-    xs = xs |> to_tensor() |> Nx.as_type({:f, 32}) |> ensure_2d(dim)
-    Shared.validate_type!(xs, {:f, 32})
-    keys = keys |> to_tensor() |> Nx.as_type({:s, 64})
-    Shared.validate_type!(keys, {:s, 64})
+  def compute_residuals(%__MODULE__{ref: ref, dim: dim}, xs, keys)
+      when is_list(xs) and is_list(keys) do
+    {n, flat} = Shared.to_flat_floats(xs)
+    validate_length!(flat, n * dim, dim)
+    data_bin = Shared.floats_to_binary(flat)
+    keys_bin = Shared.int64s_to_binary(keys)
 
-    {n, ^dim} = Nx.shape(xs)
-    data = Nx.to_binary(xs)
-    keys_bin = Nx.to_binary(Nx.reshape(keys, {n}))
-
-    case NIF.nif_compute_residuals(ref, n, data, keys_bin) do
+    case NIF.nif_compute_residuals(ref, n, data_bin, keys_bin) do
       {:ok, result_bin} ->
-        {:ok, result_bin |> Nx.from_binary({:f, 32}) |> Nx.reshape({n, dim})}
+        {:ok, result_bin |> Shared.binary_to_floats() |> Enum.chunk_every(dim)}
 
       {:error, _} = err ->
         err
@@ -301,23 +286,14 @@ defmodule FaissEx.Index do
     end
   end
 
-  # Ensures a 1D tensor {dim} becomes {1, dim}
-  defp ensure_2d(tensor, dim) do
-    case Nx.shape(tensor) do
-      {^dim} ->
-        Nx.reshape(tensor, {1, dim})
+  defp validate_length!(flat, expected, dim) do
+    actual = length(flat)
 
-      {_, ^dim} ->
-        tensor
-
-      shape ->
-        raise ArgumentError,
-              "expected tensor of shape {#{dim}} or {n, #{dim}}, got #{inspect(shape)}"
+    if actual != expected do
+      raise ArgumentError,
+            "expected #{expected} floats (n * #{dim}), got #{actual}"
     end
   end
-
-  defp to_tensor(%Nx.Tensor{} = t), do: t
-  defp to_tensor(list) when is_list(list), do: Nx.tensor(list)
 
   defp to_binary(str) when is_binary(str), do: str
   defp to_binary(str) when is_list(str), do: List.to_string(str)

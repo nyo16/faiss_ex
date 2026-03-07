@@ -38,18 +38,16 @@ defmodule FaissEx.Clustering do
   @doc """
   Trains the clustering on the given data.
 
-  Creates a flat index internally for the quantizer if no index is provided.
-  The `tensor` must be `{:f, 32}` with shape `{n, d}`.
+  Creates a flat index internally for the quantizer.
+  `data` must be a list of lists of floats with inner dimension `d`.
   """
-  def train(%__MODULE__{ref: ref, d: d} = clustering, data) do
-    tensor = data |> to_tensor() |> Nx.as_type({:f, 32}) |> ensure_2d(d)
-    Shared.validate_type!(tensor, {:f, 32})
-    {n, ^d} = Nx.shape(tensor)
-    data = Nx.to_binary(tensor)
+  def train(%__MODULE__{ref: ref, d: d} = clustering, data) when is_list(data) do
+    {n, flat} = Shared.to_flat_floats(data)
+    data_bin = Shared.floats_to_binary(flat)
 
     {:ok, quantizer} = Index.new(d, "Flat")
 
-    case NIF.nif_train_clustering(ref, n, data, quantizer.ref) do
+    case NIF.nif_train_clustering(ref, n, data_bin, quantizer.ref) do
       :ok ->
         {:ok, %__MODULE__{clustering | index: quantizer, trained?: true}}
 
@@ -59,12 +57,12 @@ defmodule FaissEx.Clustering do
   end
 
   @doc """
-  Returns the cluster centroids as an `{:f, 32}` tensor of shape `{k, d}`.
+  Returns the cluster centroids as a list of lists `[[float]]` with shape `{k, d}`.
   """
-  def get_centroids(%__MODULE__{ref: ref}) do
+  def get_centroids(%__MODULE__{ref: ref, d: d}) do
     case NIF.nif_get_clustering_centroids(ref) do
-      {:ok, {k, d, centroids_bin}} ->
-        {:ok, centroids_bin |> Nx.from_binary({:f, 32}) |> Nx.reshape({k, d})}
+      {:ok, {_k, _d, centroids_bin}} ->
+        {:ok, centroids_bin |> Shared.binary_to_floats() |> Enum.chunk_every(d)}
 
       {:error, _} = err ->
         err
@@ -74,36 +72,17 @@ defmodule FaissEx.Clustering do
   @doc """
   Assigns vectors to their nearest cluster.
 
-  Returns `%{labels: tensor, distances: tensor}` where labels are cluster IDs.
+  Returns `{:ok, %{labels: [[integer]], distances: [[float]]}}`.
   """
   def get_cluster_assignment(%__MODULE__{index: nil}, _data) do
     {:error, "clustering not trained"}
   end
 
-  def get_cluster_assignment(%__MODULE__{d: d} = clustering, data) do
-    tensor = data |> to_tensor() |> Nx.as_type({:f, 32}) |> ensure_2d(d)
-    Shared.validate_type!(tensor, {:f, 32})
-
+  def get_cluster_assignment(%__MODULE__{d: d} = clustering, data) when is_list(data) do
     with {:ok, centroids} <- get_centroids(clustering),
          {:ok, quantizer} <- Index.new(d, "Flat") do
       :ok = Index.add(quantizer, centroids)
-      Index.search(quantizer, tensor, 1)
-    end
-  end
-
-  defp to_tensor(%Nx.Tensor{} = t), do: t
-  defp to_tensor(list) when is_list(list), do: Nx.tensor(list)
-
-  defp ensure_2d(tensor, d) do
-    case Nx.shape(tensor) do
-      {^d} ->
-        Nx.reshape(tensor, {1, d})
-
-      {_, ^d} ->
-        tensor
-
-      shape ->
-        raise ArgumentError, "expected tensor of shape {#{d}} or {n, #{d}}, got #{inspect(shape)}"
+      Index.search(quantizer, data, 1)
     end
   end
 end

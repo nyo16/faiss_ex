@@ -13,18 +13,16 @@ defmodule FaissEx.ClusteringTest do
     test "trains clustering and returns centroids" do
       {:ok, clustering} = Clustering.new(4, 2)
 
-      # Two clear clusters
       data =
-        Nx.concatenate([
-          Nx.broadcast(Nx.tensor([1.0, 0.0, 0.0, 0.0], type: {:f, 32}), {50, 4}),
-          Nx.broadcast(Nx.tensor([0.0, 0.0, 0.0, 1.0], type: {:f, 32}), {50, 4})
-        ])
+        List.duplicate([1.0, 0.0, 0.0, 0.0], 50) ++
+          List.duplicate([0.0, 0.0, 0.0, 1.0], 50)
 
       {:ok, trained} = Clustering.train(clustering, data)
       assert trained.trained?
 
       {:ok, centroids} = Clustering.get_centroids(trained)
-      assert Nx.shape(centroids) == {2, 4}
+      assert length(centroids) == 2
+      assert length(hd(centroids)) == 4
     end
   end
 
@@ -33,51 +31,18 @@ defmodule FaissEx.ClusteringTest do
       {:ok, clustering} = Clustering.new(4, 2)
 
       data =
-        Nx.concatenate([
-          Nx.broadcast(Nx.tensor([1.0, 0.0, 0.0, 0.0], type: {:f, 32}), {50, 4}),
-          Nx.broadcast(Nx.tensor([0.0, 0.0, 0.0, 1.0], type: {:f, 32}), {50, 4})
-        ])
+        List.duplicate([1.0, 0.0, 0.0, 0.0], 50) ++
+          List.duplicate([0.0, 0.0, 0.0, 1.0], 50)
 
       {:ok, trained} = Clustering.train(clustering, data)
-
-      query = Nx.tensor([[1.0, 0.0, 0.0, 0.0]], type: {:f, 32})
 
       {:ok, %{labels: labels, distances: distances}} =
-        Clustering.get_cluster_assignment(trained, query)
+        Clustering.get_cluster_assignment(trained, [[1.0, 0.0, 0.0, 0.0]])
 
-      assert Nx.shape(labels) == {1, 1}
-      assert Nx.shape(distances) == {1, 1}
-    end
-  end
-
-  describe "raw list inputs" do
-    test "train with list of lists" do
-      {:ok, clustering} = Clustering.new(3, 2)
-
-      data =
-        List.duplicate([1.0, 0.0, 0.0], 50) ++
-          List.duplicate([0.0, 0.0, 1.0], 50)
-
-      {:ok, trained} = Clustering.train(clustering, data)
-      assert trained.trained?
-
-      {:ok, centroids} = Clustering.get_centroids(trained)
-      assert Nx.shape(centroids) == {2, 3}
-    end
-
-    test "get_cluster_assignment with list query" do
-      {:ok, clustering} = Clustering.new(3, 2)
-
-      data =
-        List.duplicate([1.0, 0.0, 0.0], 50) ++
-          List.duplicate([0.0, 0.0, 1.0], 50)
-
-      {:ok, trained} = Clustering.train(clustering, data)
-
-      {:ok, %{labels: labels}} =
-        Clustering.get_cluster_assignment(trained, [[1.0, 0.0, 0.0]])
-
-      assert Nx.shape(labels) == {1, 1}
+      assert length(labels) == 1
+      assert length(hd(labels)) == 1
+      assert length(distances) == 1
+      assert length(hd(distances)) == 1
     end
   end
 

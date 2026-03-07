@@ -22,7 +22,7 @@ defmodule FaissEx.MixProject do
   defp deps do
     [
       {:elixir_make, "~> 0.9", runtime: false},
-      {:nx, "~> 0.9"}
+      {:benchee, "~> 1.3", only: :dev, runtime: false}
     ]
   end
 
