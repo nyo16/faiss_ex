@@ -145,19 +145,175 @@ keys = Nx.tensor([0, 5, 10], type: {:s, 64})
 # vectors: {3, dim} f32 tensor
 ```
 
-### K-means clustering
+### Computing residuals
+
+Compute the difference between vectors and their quantized reconstructions:
 
 ```elixir
-{:ok, clustering} = FaissEx.Clustering.new(128, 10)  # 128-dim, 10 clusters
+{:ok, index} = FaissEx.Index.new(4, "Flat")
+vectors = Nx.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], type: {:f, 32})
+:ok = FaissEx.Index.add(index, vectors)
 
-data = Nx.random_uniform({5000, 128}, type: {:f, 32})
+keys = Nx.tensor([0, 1], type: {:s, 64})
+{:ok, residuals} = FaissEx.Index.compute_residuals(index, vectors, keys)
+# For a flat index, residuals are zero (exact reconstruction)
+```
+
+### Batch search
+
+Search with multiple query vectors at once for better throughput:
+
+```elixir
+{:ok, index} = FaissEx.Index.new(128, "Flat")
+:ok = FaissEx.Index.add(index, corpus_vectors)
+
+# Search 100 queries at once
+queries = Nx.tensor(batch_of_queries, type: {:f, 32})  # {100, 128}
+{:ok, %{distances: distances, labels: labels}} = FaissEx.Index.search(index, queries, 10)
+# distances: {100, 10} - top 10 distances per query
+# labels: {100, 10} - top 10 vector IDs per query
+```
+
+## Choosing an Index
+
+| Index | Training | Memory | Speed | Recall | Best for |
+|-------|----------|--------|-------|--------|----------|
+| `"Flat"` | No | High | Slow (brute force) | 100% | < 100K vectors, exact results |
+| `"IVFx,Flat"` | Yes | High | Fast | ~95% | 100K-10M vectors |
+| `"HNSWx"` | No | High | Very fast | ~99% | Read-heavy workloads |
+| `"IVFx,PQy"` | Yes | Low | Fast | ~90% | 1M+ vectors, memory constrained |
+| `"IVFx,SQfp16"` | Yes | Medium | Fast | ~97% | 1M+ vectors, good recall/memory balance |
+| `"Flat"` + `:inner_product` | No | High | Slow | 100% | Cosine similarity (normalize first) |
+
+`x` = number of IVF clusters (typical: `4*sqrt(n)`), `y` = PQ subquantizers (typical: `dim/4`).
+
+### Practical guidelines
+
+- **Under 100K vectors**: Use `"Flat"`. It's brute force but fast enough and gives exact results.
+- **100K to 1M vectors**: Use `"IVF{nlist},Flat"` where `nlist = 4*sqrt(n)`. Train on at least `40*nlist` vectors.
+- **1M+ vectors**: Use `"IVF{nlist},PQ{m}"` or `"HNSW32"`. PQ compresses vectors to save memory.
+- **Cosine similarity**: Normalize your vectors to unit length first, then use `:inner_product` metric.
+
+```elixir
+# Cosine similarity search
+normalized = Nx.divide(vectors, Nx.LinAlg.norm(vectors, axes: [1], keep_axes: true))
+{:ok, index} = FaissEx.Index.new(128, "Flat", metric: :inner_product)
+:ok = FaissEx.Index.add(index, normalized)
+```
+
+### IDMap wrapper
+
+FAISS indexes assign sequential IDs by default (0, 1, 2...). Wrap with `"IDMap,"` to use your own IDs:
+
+```elixir
+# Custom IDs with any index type
+{:ok, index} = FaissEx.Index.new(128, "IDMap,Flat")
+{:ok, index} = FaissEx.Index.new(128, "IDMap,HNSW32")
+
+ids = Nx.tensor([42, 99, 1337], type: {:s, 64})
+:ok = FaissEx.Index.add_with_ids(index, vectors, ids)
+
+{:ok, %{labels: labels}} = FaissEx.Index.search(index, query, 5)
+# labels now contain your custom IDs (42, 99, 1337...)
+```
+
+## K-means Clustering
+
+### Basic clustering
+
+```elixir
+# Cluster 128-dimensional vectors into 10 groups
+{:ok, clustering} = FaissEx.Clustering.new(128, 10)
+
+data = Nx.iota({5000, 128}, type: {:f, 32})
 {:ok, trained} = FaissEx.Clustering.train(clustering, data)
 
 {:ok, centroids} = FaissEx.Clustering.get_centroids(trained)
-# centroids: {10, 128} f32 tensor
+# centroids: {10, 128} f32 tensor — center of each cluster
+```
 
-# Assign vectors to nearest cluster
-{:ok, %{labels: labels}} = FaissEx.Clustering.get_cluster_assignment(trained, data)
+### Assigning vectors to clusters
+
+```elixir
+# Which cluster does each vector belong to?
+{:ok, %{labels: labels, distances: distances}} =
+  FaissEx.Clustering.get_cluster_assignment(trained, data)
+# labels: {5000, 1} s64 tensor of cluster IDs
+# distances: {5000, 1} f32 tensor of distances to nearest centroid
+```
+
+### Clustering for preprocessing
+
+Use clustering to build an IVF quantizer or to reduce a dataset:
+
+```elixir
+# Cluster embeddings, then keep only vectors near centroids
+{:ok, clustering} = FaissEx.Clustering.new(dim, num_clusters)
+{:ok, trained} = FaissEx.Clustering.train(clustering, embeddings)
+{:ok, %{labels: labels, distances: dists}} =
+  FaissEx.Clustering.get_cluster_assignment(trained, embeddings)
+
+# Filter to vectors within distance threshold
+threshold = 10.0
+mask = Nx.less(Nx.reshape(dists, {n}), threshold)
+```
+
+## Thread Safety
+
+- **Concurrent reads** (search) on the same index are safe
+- **Concurrent writes** (add) on the same index are **not safe** — serialize writes or use separate indexes
+- Heavy operations (add, search, train) run on BEAM dirty CPU schedulers so they don't block normal Erlang processes
+- File I/O (to_file, from_file) runs on dirty IO schedulers
+
+## Architecture
+
+FaissEx uses Erlang NIF (Native Implemented Functions) to call FAISS through its C API:
+
+```
+Elixir (FaissEx.Index) → NIF stubs (FaissEx.NIF) → C (faiss_ex_nif.c) → libfaiss_c → libfaiss (C++)
+```
+
+- **Single C file**: All NIF code lives in `c_src/faiss_ex_nif.c`
+- **NIF resources**: FAISS index pointers are wrapped in NIF resource types with destructors, so BEAM GC handles cleanup
+- **No processes**: FaissEx uses plain functions and data — no GenServers or supervision trees
+- **Nx integration**: Vectors flow in/out as Nx tensors; binary data is passed directly to FAISS with zero copy where possible
+
+## Troubleshooting
+
+### `OpenMP not found` during build
+
+On macOS, install libomp:
+
+```bash
+brew install libomp
+```
+
+### `Library not loaded: libfaiss_c.dylib`
+
+The shared libraries weren't installed correctly. Clean and rebuild:
+
+```bash
+mix clean
+mix compile
+```
+
+### Build takes too long
+
+The first build compiles FAISS from source. This is cached at `~/.cache/faiss_ex/`. To force a clean FAISS rebuild:
+
+```bash
+rm -rf ~/.cache/faiss_ex/
+mix compile
+```
+
+### `cmake` not found
+
+```bash
+# macOS
+brew install cmake
+
+# Ubuntu/Debian
+sudo apt install cmake
 ```
 
 ## GPU Support
