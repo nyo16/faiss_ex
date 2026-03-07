@@ -54,21 +54,29 @@ Set these environment variables before `mix compile`:
 
 ## Usage
 
+All functions that accept vectors work with **Nx tensors**, **plain lists**, or **lists of lists**:
+
+```elixir
+# All three are equivalent:
+FaissEx.Index.add(index, Nx.tensor([[1.0, 2.0, 3.0]], type: {:f, 32}))
+FaissEx.Index.add(index, [1.0, 2.0, 3.0])
+FaissEx.Index.add(index, [[1.0, 2.0, 3.0]])
+```
+
 ### Creating an index and searching
 
 ```elixir
 # Create a flat L2 index with 128 dimensions
 {:ok, index} = FaissEx.Index.new(128, "Flat")
 
-# Add vectors (Nx tensors, f32)
-vectors = Nx.random_uniform({1000, 128}, type: {:f, 32})
-:ok = FaissEx.Index.add(index, vectors)
+# Add vectors — Nx tensors or plain lists
+:ok = FaissEx.Index.add(index, some_nx_tensor)
+:ok = FaissEx.Index.add(index, [[0.1, 0.2, ...], [0.3, 0.4, ...]])
 
 # Search for 5 nearest neighbors
-query = Nx.random_uniform({1, 128}, type: {:f, 32})
 {:ok, %{distances: distances, labels: labels}} = FaissEx.Index.search(index, query, 5)
-# distances: {1, 5} f32 tensor
-# labels: {1, 5} s64 tensor of vector indices
+# distances: {n, 5} f32 tensor
+# labels: {n, 5} s64 tensor of vector indices
 ```
 
 ### Index types

@@ -232,6 +232,202 @@ defmodule FaissEx.IndexTest do
     end
   end
 
+  describe "raw list inputs" do
+    test "add with a flat list (single vector)" do
+      {:ok, index} = Index.new(3, "Flat")
+      assert :ok = Index.add(index, [1.0, 2.0, 3.0])
+      assert {:ok, 1} = Index.ntotal(index)
+    end
+
+    test "add with a list of lists (batch)" do
+      {:ok, index} = Index.new(3, "Flat")
+
+      assert :ok =
+               Index.add(index, [
+                 [1.0, 0.0, 0.0],
+                 [0.0, 1.0, 0.0],
+                 [0.0, 0.0, 1.0]
+               ])
+
+      assert {:ok, 3} = Index.ntotal(index)
+    end
+
+    test "search with a list query" do
+      {:ok, index} = Index.new(3, "Flat")
+
+      :ok =
+        Index.add(index, [
+          [1.0, 0.0, 0.0],
+          [0.0, 1.0, 0.0],
+          [0.0, 0.0, 1.0]
+        ])
+
+      {:ok, %{labels: labels}} = Index.search(index, [1.0, 0.0, 0.0], 1)
+      assert Nx.to_number(labels[0][0]) == 0
+    end
+
+    test "search with a list of list queries" do
+      {:ok, index} = Index.new(3, "Flat")
+
+      :ok =
+        Index.add(index, [
+          [1.0, 0.0, 0.0],
+          [0.0, 1.0, 0.0],
+          [0.0, 0.0, 1.0]
+        ])
+
+      {:ok, %{labels: labels}} =
+        Index.search(index, [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], 1)
+
+      assert Nx.to_number(labels[0][0]) == 1
+      assert Nx.to_number(labels[1][0]) == 2
+    end
+
+    test "add_with_ids with lists" do
+      {:ok, index} = Index.new(3, "IDMap,Flat")
+
+      assert :ok =
+               Index.add_with_ids(
+                 index,
+                 [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                 [42, 99]
+               )
+
+      assert {:ok, 2} = Index.ntotal(index)
+    end
+
+    test "reconstruct with list keys" do
+      {:ok, index} = Index.new(3, "Flat")
+      :ok = Index.add(index, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+      {:ok, reconstructed} = Index.reconstruct(index, [0, 1])
+      assert Nx.shape(reconstructed) == {2, 3}
+      assert_in_delta Nx.to_number(reconstructed[0][0]), 1.0, 1.0e-6
+      assert_in_delta Nx.to_number(reconstructed[1][0]), 4.0, 1.0e-6
+    end
+
+    test "compute_residuals with lists" do
+      {:ok, index} = Index.new(3, "Flat")
+      :ok = Index.add(index, [[1.0, 2.0, 3.0]])
+
+      {:ok, residuals} = Index.compute_residuals(index, [[1.0, 2.0, 3.0]], [0])
+      # Flat index reconstructs exactly, so residuals should be ~0
+      assert_in_delta Nx.to_number(Nx.sum(Nx.abs(residuals))), 0.0, 1.0e-6
+    end
+
+    test "train with lists" do
+      {:ok, index} = Index.new(4, "IVF2,Flat")
+
+      training_data =
+        for _ <- 1..100 do
+          for _ <- 1..4, do: :rand.uniform()
+        end
+
+      assert :ok = Index.train(index, training_data)
+      assert {:ok, true} = Index.trained?(index)
+    end
+  end
+
+  describe "inner product metric" do
+    test "returns higher scores for more similar vectors" do
+      {:ok, index} = Index.new(3, "Flat", metric: :inner_product)
+
+      :ok =
+        Index.add(index, [
+          [1.0, 0.0, 0.0],
+          [0.0, 1.0, 0.0],
+          [0.9, 0.1, 0.0]
+        ])
+
+      {:ok, %{labels: labels}} = Index.search(index, [1.0, 0.0, 0.0], 1)
+      # Vector 0 should be the best match for inner product with [1,0,0]
+      assert Nx.to_number(labels[0][0]) == 0
+    end
+  end
+
+  describe "HNSW index" do
+    test "creates and searches HNSW index" do
+      {:ok, index} = Index.new(8, "HNSW32")
+      assert {:ok, true} = Index.trained?(index)
+
+      key = Nx.Random.key(123)
+      {vectors, _key} = Nx.Random.uniform(key, shape: {100, 8}, type: {:f, 32})
+      :ok = Index.add(index, vectors)
+
+      assert {:ok, 100} = Index.ntotal(index)
+
+      {:ok, %{distances: distances, labels: labels}} = Index.search(index, vectors[0], 5)
+      assert Nx.shape(distances) == {1, 5}
+      assert Nx.shape(labels) == {1, 5}
+      # First result should be vector 0 itself
+      assert Nx.to_number(labels[0][0]) == 0
+    end
+  end
+
+  describe "edge cases" do
+    test "search returns -1 labels when index is empty" do
+      {:ok, index} = Index.new(4, "Flat")
+      {:ok, %{labels: labels}} = Index.search(index, [0.0, 0.0, 0.0, 0.0], 3)
+      # FAISS returns -1 for missing neighbors
+      assert Nx.to_flat_list(labels) == [-1, -1, -1]
+    end
+
+    test "adding after reset works" do
+      {:ok, index} = Index.new(3, "Flat")
+      :ok = Index.add(index, [1.0, 0.0, 0.0])
+      assert {:ok, 1} = Index.ntotal(index)
+
+      :ok = Index.reset(index)
+      assert {:ok, 0} = Index.ntotal(index)
+
+      :ok = Index.add(index, [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+      assert {:ok, 2} = Index.ntotal(index)
+    end
+
+    test "file round-trip preserves search results" do
+      {:ok, index} = Index.new(3, "Flat")
+
+      :ok =
+        Index.add(index, [
+          [1.0, 0.0, 0.0],
+          [0.0, 1.0, 0.0],
+          [0.0, 0.0, 1.0]
+        ])
+
+      path = Path.join(System.tmp_dir!(), "faiss_ex_roundtrip_#{:rand.uniform(100_000)}.index")
+
+      try do
+        :ok = Index.to_file(index, path)
+        {:ok, loaded} = Index.from_file(path)
+
+        {:ok, %{labels: orig_labels}} = Index.search(index, [1.0, 0.0, 0.0], 3)
+        {:ok, %{labels: loaded_labels}} = Index.search(loaded, [1.0, 0.0, 0.0], 3)
+
+        assert Nx.to_flat_list(orig_labels) == Nx.to_flat_list(loaded_labels)
+      after
+        File.rm(path)
+      end
+    end
+
+    test "clone preserves search results independently" do
+      {:ok, index} = Index.new(3, "Flat")
+      :ok = Index.add(index, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+
+      {:ok, cloned} = Index.clone(index)
+
+      # Add to clone only
+      :ok = Index.add(cloned, [0.0, 0.0, 1.0])
+      assert {:ok, 2} = Index.ntotal(index)
+      assert {:ok, 3} = Index.ntotal(cloned)
+
+      # Both should still find vector 0 as nearest to [1,0,0]
+      {:ok, %{labels: orig}} = Index.search(index, [1.0, 0.0, 0.0], 1)
+      {:ok, %{labels: clone_l}} = Index.search(cloned, [1.0, 0.0, 0.0], 1)
+      assert Nx.to_number(orig[0][0]) == 0
+      assert Nx.to_number(clone_l[0][0]) == 0
+    end
+  end
+
   describe "get_num_gpus" do
     test "returns a non-negative integer" do
       {:ok, count} = FaissEx.NIF.nif_get_num_gpus()

@@ -41,8 +41,8 @@ defmodule FaissEx.Clustering do
   Creates a flat index internally for the quantizer if no index is provided.
   The `tensor` must be `{:f, 32}` with shape `{n, d}`.
   """
-  def train(%__MODULE__{ref: ref, d: d} = clustering, tensor) do
-    tensor = tensor |> Nx.as_type({:f, 32}) |> ensure_2d(d)
+  def train(%__MODULE__{ref: ref, d: d} = clustering, data) do
+    tensor = data |> to_tensor() |> Nx.as_type({:f, 32}) |> ensure_2d(d)
     Shared.validate_type!(tensor, {:f, 32})
     {n, ^d} = Nx.shape(tensor)
     data = Nx.to_binary(tensor)
@@ -76,12 +76,12 @@ defmodule FaissEx.Clustering do
 
   Returns `%{labels: tensor, distances: tensor}` where labels are cluster IDs.
   """
-  def get_cluster_assignment(%__MODULE__{index: nil}, _tensor) do
+  def get_cluster_assignment(%__MODULE__{index: nil}, _data) do
     {:error, "clustering not trained"}
   end
 
-  def get_cluster_assignment(%__MODULE__{d: d} = clustering, tensor) do
-    tensor = tensor |> Nx.as_type({:f, 32}) |> ensure_2d(d)
+  def get_cluster_assignment(%__MODULE__{d: d} = clustering, data) do
+    tensor = data |> to_tensor() |> Nx.as_type({:f, 32}) |> ensure_2d(d)
     Shared.validate_type!(tensor, {:f, 32})
 
     with {:ok, centroids} <- get_centroids(clustering),
@@ -90,6 +90,9 @@ defmodule FaissEx.Clustering do
       Index.search(quantizer, tensor, 1)
     end
   end
+
+  defp to_tensor(%Nx.Tensor{} = t), do: t
+  defp to_tensor(list) when is_list(list), do: Nx.tensor(list)
 
   defp ensure_2d(tensor, d) do
     case Nx.shape(tensor) do

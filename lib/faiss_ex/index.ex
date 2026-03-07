@@ -57,10 +57,16 @@ defmodule FaissEx.Index do
   @doc """
   Adds vectors to the index.
 
-  Accepts an Nx tensor of type `{:f, 32}` with shape `{n, dim}` or `{dim}`.
+  Accepts an Nx tensor, a flat list of floats (single vector), or a list of lists.
+
+  ## Examples
+
+      :ok = FaissEx.Index.add(index, Nx.tensor([[1.0, 2.0, 3.0]], type: {:f, 32}))
+      :ok = FaissEx.Index.add(index, [1.0, 2.0, 3.0])
+      :ok = FaissEx.Index.add(index, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
   """
-  def add(%__MODULE__{ref: ref, dim: dim}, tensor) do
-    tensor = tensor |> Nx.as_type({:f, 32}) |> ensure_2d(dim)
+  def add(%__MODULE__{ref: ref, dim: dim}, data) do
+    tensor = data |> to_tensor() |> Nx.as_type({:f, 32}) |> ensure_2d(dim)
     Shared.validate_type!(tensor, {:f, 32})
     {n, ^dim} = Nx.shape(tensor)
     data = Nx.to_binary(tensor)
@@ -74,12 +80,16 @@ defmodule FaissEx.Index do
   @doc """
   Adds vectors with explicit IDs.
 
-  `ids` must be an `{:s, 64}` tensor of shape `{n}`.
+  `ids` can be an `{:s, 64}` tensor or a list of integers.
+
+  ## Examples
+
+      :ok = FaissEx.Index.add_with_ids(index, [[1.0, 2.0]], [100])
   """
-  def add_with_ids(%__MODULE__{ref: ref, dim: dim} = _index, tensor, ids) do
-    tensor = tensor |> Nx.as_type({:f, 32}) |> ensure_2d(dim)
+  def add_with_ids(%__MODULE__{ref: ref, dim: dim} = _index, data, ids) do
+    tensor = data |> to_tensor() |> Nx.as_type({:f, 32}) |> ensure_2d(dim)
     Shared.validate_type!(tensor, {:f, 32})
-    ids = Nx.as_type(ids, {:s, 64})
+    ids = ids |> to_tensor() |> Nx.as_type({:s, 64})
     Shared.validate_type!(ids, {:s, 64})
 
     {n, ^dim} = Nx.shape(tensor)
@@ -99,8 +109,8 @@ defmodule FaissEx.Index do
     * `distances` has shape `{n, k}` and type `{:f, 32}`
     * `labels` has shape `{n, k}` and type `{:s, 64}`
   """
-  def search(%__MODULE__{ref: ref, dim: dim}, tensor, k) do
-    tensor = tensor |> Nx.as_type({:f, 32}) |> ensure_2d(dim)
+  def search(%__MODULE__{ref: ref, dim: dim}, data, k) do
+    tensor = data |> to_tensor() |> Nx.as_type({:f, 32}) |> ensure_2d(dim)
     Shared.validate_type!(tensor, {:f, 32})
     {n, ^dim} = Nx.shape(tensor)
     data = Nx.to_binary(tensor)
@@ -119,8 +129,8 @@ defmodule FaissEx.Index do
   @doc """
   Trains the index (required for IVF, PQ, etc.).
   """
-  def train(%__MODULE__{ref: ref, dim: dim} = _index, tensor) do
-    tensor = tensor |> Nx.as_type({:f, 32}) |> ensure_2d(dim)
+  def train(%__MODULE__{ref: ref, dim: dim} = _index, data) do
+    tensor = data |> to_tensor() |> Nx.as_type({:f, 32}) |> ensure_2d(dim)
     Shared.validate_type!(tensor, {:f, 32})
     {n, ^dim} = Nx.shape(tensor)
     data = Nx.to_binary(tensor)
@@ -161,7 +171,7 @@ defmodule FaissEx.Index do
   Returns an `{:f, 32}` tensor of shape `{n, dim}`.
   """
   def reconstruct(%__MODULE__{ref: ref, dim: dim}, keys) do
-    keys = Nx.as_type(keys, {:s, 64})
+    keys = keys |> to_tensor() |> Nx.as_type({:s, 64})
     Shared.validate_type!(keys, {:s, 64})
     keys_flat = Nx.reshape(keys, {Nx.size(keys)})
     n = Nx.size(keys_flat)
@@ -180,9 +190,9 @@ defmodule FaissEx.Index do
   Computes residuals: `xs - reconstruct(keys)`.
   """
   def compute_residuals(%__MODULE__{ref: ref, dim: dim}, xs, keys) do
-    xs = xs |> Nx.as_type({:f, 32}) |> ensure_2d(dim)
+    xs = xs |> to_tensor() |> Nx.as_type({:f, 32}) |> ensure_2d(dim)
     Shared.validate_type!(xs, {:f, 32})
-    keys = Nx.as_type(keys, {:s, 64})
+    keys = keys |> to_tensor() |> Nx.as_type({:s, 64})
     Shared.validate_type!(keys, {:s, 64})
 
     {n, ^dim} = Nx.shape(xs)
@@ -305,6 +315,9 @@ defmodule FaissEx.Index do
               "expected tensor of shape {#{dim}} or {n, #{dim}}, got #{inspect(shape)}"
     end
   end
+
+  defp to_tensor(%Nx.Tensor{} = t), do: t
+  defp to_tensor(list) when is_list(list), do: Nx.tensor(list)
 
   defp to_binary(str) when is_binary(str), do: str
   defp to_binary(str) when is_list(str), do: List.to_string(str)
