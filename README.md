@@ -174,6 +174,173 @@ queries = Nx.tensor(batch_of_queries, type: {:f, 32})  # {100, 128}
 # labels: {100, 10} - top 10 vector IDs per query
 ```
 
+## Example: Semantic Search with Bumblebee Embeddings
+
+A complete example using [Bumblebee](https://github.com/elixir-nx/bumblebee) to generate sentence embeddings and FaissEx to search them.
+
+### Setup
+
+Add Bumblebee and an EXLA/Torchx backend to your deps:
+
+```elixir
+def deps do
+  [
+    {:faiss_ex, "~> 0.1.0"},
+    {:bumblebee, "~> 0.6"},
+    {:exla, "~> 0.9"}
+  ]
+end
+```
+
+### Building an embedding index
+
+```elixir
+# Load a sentence-transformers model
+{:ok, model_info} = Bumblebee.load_model({:hf, "sentence-transformers/all-MiniLM-L6-v2"})
+{:ok, tokenizer} = Bumblebee.load_tokenizer({:hf, "sentence-transformers/all-MiniLM-L6-v2"})
+
+serving = Bumblebee.Text.text_embedding(model_info, tokenizer,
+  compile: [batch_size: 32, sequence_length: 128],
+  defn_options: [compiler: EXLA]
+)
+
+# Your document corpus
+documents = [
+  "The cat sat on the mat",
+  "A dog played in the park",
+  "Elixir is a functional programming language",
+  "Phoenix is a web framework for Elixir",
+  "FAISS enables fast similarity search",
+  "Machine learning models generate embeddings",
+  "Vectors can represent semantic meaning",
+  "The quick brown fox jumps over the lazy dog"
+]
+
+# Generate embeddings for all documents
+embeddings =
+  documents
+  |> Enum.map(fn doc ->
+    %{embedding: embedding} = Nx.Serving.run(serving, doc)
+    embedding
+  end)
+  |> Nx.stack()
+
+# embeddings: {8, 384} f32 tensor (MiniLM outputs 384-dim vectors)
+{n, dim} = Nx.shape(embeddings)
+
+# Normalize for cosine similarity
+norms = Nx.LinAlg.norm(embeddings, axes: [1], keep_axes: true)
+normalized = Nx.divide(embeddings, norms)
+
+# Build the FAISS index
+{:ok, index} = FaissEx.Index.new(dim, "Flat", metric: :inner_product)
+:ok = FaissEx.Index.add(index, normalized)
+```
+
+### Querying
+
+```elixir
+# Embed the query
+query_text = "functional programming with Elixir"
+%{embedding: query_embedding} = Nx.Serving.run(serving, query_text)
+
+# Normalize
+query_norm = Nx.LinAlg.norm(query_embedding)
+query_normalized = Nx.divide(query_embedding, query_norm)
+
+# Search for top 3 most similar documents
+{:ok, %{distances: scores, labels: indices}} =
+  FaissEx.Index.search(index, query_normalized, 3)
+
+# Display results
+indices
+|> Nx.to_flat_list()
+|> Enum.zip(Nx.to_flat_list(scores))
+|> Enum.each(fn {idx, score} ->
+  IO.puts("#{Float.round(score, 4)} - #{Enum.at(documents, idx)}")
+end)
+
+# Output (similarity scores, higher = more similar):
+# 0.8234 - Elixir is a functional programming language
+# 0.7891 - Phoenix is a web framework for Elixir
+# 0.4012 - Machine learning models generate embeddings
+```
+
+### Scaling up with IVF
+
+For larger corpora (100K+ documents), use an IVF index:
+
+```elixir
+n_documents = length(documents)
+nlist = max(round(4 * :math.sqrt(n_documents)), 1)
+
+{:ok, index} = FaissEx.Index.new(dim, "IVF#{nlist},Flat", metric: :inner_product)
+
+# Train on your embeddings (or a representative sample)
+:ok = FaissEx.Index.train(index, normalized)
+:ok = FaissEx.Index.add(index, normalized)
+
+# Save for later use
+:ok = FaissEx.Index.to_file(index, "embeddings.index")
+```
+
+### Persistent search service
+
+A simple pattern for serving search in a Phoenix app:
+
+```elixir
+defmodule MyApp.SemanticSearch do
+  @index_path "priv/embeddings.index"
+
+  def load_index do
+    {:ok, index} = FaissEx.Index.from_file(@index_path)
+    index
+  end
+
+  def search(index, serving, query_text, k \\ 5) do
+    %{embedding: embedding} = Nx.Serving.run(serving, query_text)
+    norm = Nx.LinAlg.norm(embedding)
+    normalized = Nx.divide(embedding, norm)
+
+    {:ok, %{distances: scores, labels: indices}} =
+      FaissEx.Index.search(index, normalized, k)
+
+    Enum.zip(
+      Nx.to_flat_list(indices),
+      Nx.to_flat_list(scores)
+    )
+  end
+end
+```
+
+### Using OpenAI / other external embeddings
+
+If your embeddings come from an external API as lists of floats:
+
+```elixir
+# Embeddings from any source (OpenAI, Cohere, Voyage, etc.)
+raw_embeddings = [
+  [0.023, -0.041, 0.067, ...],  # 1536-dim for text-embedding-3-small
+  [0.011, -0.032, 0.089, ...],
+  # ...
+]
+
+dim = length(hd(raw_embeddings))
+embeddings = Nx.tensor(raw_embeddings, type: {:f, 32})
+
+# Normalize and index
+norms = Nx.LinAlg.norm(embeddings, axes: [1], keep_axes: true)
+normalized = Nx.divide(embeddings, norms)
+
+{:ok, index} = FaissEx.Index.new(dim, "Flat", metric: :inner_product)
+:ok = FaissEx.Index.add(index, normalized)
+
+# Query with a new embedding from the same API
+query_embedding = Nx.tensor([query_floats], type: {:f, 32})
+query_normalized = Nx.divide(query_embedding, Nx.LinAlg.norm(query_embedding))
+{:ok, results} = FaissEx.Index.search(index, query_normalized, 10)
+```
+
 ## Choosing an Index
 
 | Index | Training | Memory | Speed | Recall | Best for |
