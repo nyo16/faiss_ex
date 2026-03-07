@@ -313,7 +313,7 @@ Elixir (FaissEx.Index) → NIF stubs (FaissEx.NIF) → C (faiss_ex_nif.c) → li
 - **Single C file**: All NIF code lives in `c_src/faiss_ex_nif.c`
 - **NIF resources**: FAISS index pointers are wrapped in NIF resource types with destructors, so BEAM GC handles cleanup
 - **No processes**: FaissEx uses plain functions and data — no GenServers or supervision trees
-- **No dependencies**: Vectors flow in/out as plain lists; binary conversion happens in `FaissEx.Shared`
+- **No dependencies**: Vectors flow in/out as plain lists; binary conversion happens internally
 
 ## Troubleshooting
 
@@ -437,4 +437,4 @@ mix run bench/faiss_ex_bench.exs
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0.
