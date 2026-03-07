@@ -1,6 +1,23 @@
 defmodule FaissEx.Clustering do
   @moduledoc """
-  FAISS clustering (k-means) operations.
+  K-means clustering using FAISS.
+
+  Partitions vectors into `k` clusters and returns cluster centroids.
+  Also supports assigning new vectors to their nearest cluster.
+
+  ## Example
+
+      {:ok, clustering} = FaissEx.Clustering.new(128, 10)
+
+      data = for _ <- 1..5000, do: for(_ <- 1..128, do: :rand.uniform())
+      {:ok, trained} = FaissEx.Clustering.train(clustering, data)
+
+      {:ok, centroids} = FaissEx.Clustering.get_centroids(trained)
+      # centroids: 10 lists of 128 floats each
+
+      {:ok, %{labels: labels}} =
+        FaissEx.Clustering.get_cluster_assignment(trained, [hd(data)])
+      # labels: [[cluster_id]]
   """
 
   alias FaissEx.NIF

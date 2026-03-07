@@ -47,7 +47,11 @@ defmodule FaissEx.MixProject do
     [
       main: "readme",
       extras: ["README.md", "CHANGELOG.md"],
-      source_ref: "v#{@version}"
+      source_ref: "v#{@version}",
+      groups_for_modules: [
+        "Core API": [FaissEx, FaissEx.Index, FaissEx.Clustering]
+      ],
+      nest_modules_by_prefix: [FaissEx]
     ]
   end
 

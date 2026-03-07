@@ -1,6 +1,40 @@
 defmodule FaissEx.Index do
   @moduledoc """
-  FAISS index operations for vector similarity search.
+  Create, populate, search, and manage FAISS indexes.
+
+  An index holds a collection of vectors and supports nearest-neighbor search.
+  Vectors are passed as flat lists (single vector) or lists of lists (batch).
+
+  ## Creating and searching
+
+      {:ok, index} = FaissEx.Index.new(4, "Flat")
+      :ok = FaissEx.Index.add(index, [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+
+      {:ok, %{distances: distances, labels: labels}} =
+        FaissEx.Index.search(index, [1.0, 0.0, 0.0, 0.0], 2)
+      # labels => [[0, 1]], distances => [[0.0, 2.0]]
+
+  ## Index types
+
+  Use [FAISS index factory strings](https://github.com/facebookresearch/faiss/wiki/The-index-factory)
+  to create different index types:
+
+    * `"Flat"` — exact brute-force search
+    * `"IVF256,Flat"` — inverted file index (call `train/2` first)
+    * `"HNSW32"` — graph-based approximate search
+    * `"IDMap,Flat"` — flat index with custom vector IDs
+
+  ## File I/O
+
+      :ok = FaissEx.Index.to_file(index, "/tmp/my.index")
+      {:ok, loaded} = FaissEx.Index.from_file("/tmp/my.index")
+
+  ## GPU support
+
+  Requires building with `USE_CUDA=true`:
+
+      {:ok, gpu_index} = FaissEx.Index.cpu_to_gpu(index, 0)
+      {:ok, cpu_index} = FaissEx.Index.gpu_to_cpu(gpu_index)
   """
 
   alias FaissEx.NIF
