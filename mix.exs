@@ -60,11 +60,17 @@ defmodule FaissEx.MixProject do
   end
 
   defp make_env do
-    %{
+    env = %{
       "USE_CUDA" => System.get_env("USE_CUDA", "false"),
+      "FAISS_OPT_LEVEL" => System.get_env("FAISS_OPT_LEVEL", "generic"),
       "FAISS_GIT_REPO" =>
         System.get_env("FAISS_GIT_REPO", "https://github.com/facebookresearch/faiss.git"),
       "FAISS_GIT_REV" => System.get_env("FAISS_GIT_REV", "v1.10.0")
     }
+
+    case System.get_env("FAISS_PREFIX") do
+      nil -> env
+      prefix -> Map.put(env, "FAISS_PREFIX", prefix)
+    end
   end
 end

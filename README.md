@@ -15,9 +15,10 @@ Binds to FAISS via its official C API (`libfaiss_c`). No external dependencies b
 
 ## Prerequisites
 
-- Erlang/OTP with NIF support
-- CMake 3.17+
+- Erlang/OTP 27+ with NIF support
+- Elixir 1.18+
 - C/C++ compiler (gcc or clang)
+- **Either** a system FAISS installation **or** CMake 3.17+ to build from source
 - On macOS Apple Silicon: `brew install libomp`
 - For GPU support: CUDA toolkit
 
@@ -40,17 +41,70 @@ mix deps.get
 mix compile
 ```
 
-The first build clones and compiles FAISS from source (~5-15 min). Subsequent builds use the cached version at `~/.cache/faiss_ex/`.
+### Option A: Build FAISS from source (default)
+
+By default, the first `mix compile` clones FAISS from GitHub and builds it from source. This takes ~5-15 minutes but requires no pre-installed FAISS. The result is cached at `~/.cache/faiss_ex/` — subsequent builds are fast.
+
+```bash
+# Just works — no extra setup needed (besides cmake and a C++ compiler)
+mix compile
+```
+
+### Option B: Use a system-installed FAISS
+
+If you already have FAISS installed (via a package manager or custom build), point `FAISS_PREFIX` at it to skip building from source entirely:
+
+```bash
+# macOS (Homebrew)
+brew install faiss
+FAISS_PREFIX=$(brew --prefix faiss) mix compile
+
+# Ubuntu/Debian
+sudo apt install libfaiss-dev
+FAISS_PREFIX=/usr mix compile
+
+# Conda
+conda install -c pytorch faiss-cpu
+FAISS_PREFIX=$CONDA_PREFIX mix compile
+
+# Custom install location
+FAISS_PREFIX=/opt/faiss mix compile
+```
+
+`FAISS_PREFIX` should point to a directory containing `include/` (with `c_api/` headers) and `lib/` (with `libfaiss` and `libfaiss_c` shared libraries).
+
+> **Note:** Most system packages ship `libfaiss` but not `libfaiss_c` (the C API wrapper). If you get linker errors about `libfaiss_c`, you may need to build from source — just omit `FAISS_PREFIX` and let FaissEx handle it.
 
 ### Build configuration
 
-Set these environment variables before `mix compile`:
-
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `FAISS_PREFIX` | *(unset)* | Path to system FAISS install. When set, skips building from source |
+| `FAISS_OPT_LEVEL` | `generic` | SIMD optimization level (see below). Only used when building from source |
 | `USE_CUDA` | `false` | Set to `true` to enable GPU support |
-| `FAISS_GIT_REPO` | `https://github.com/facebookresearch/faiss.git` | FAISS git repository |
-| `FAISS_GIT_REV` | `v1.10.0` | FAISS version tag or commit |
+| `FAISS_GIT_REPO` | `https://github.com/facebookresearch/faiss.git` | FAISS git repository (ignored when `FAISS_PREFIX` is set) |
+| `FAISS_GIT_REV` | `v1.10.0` | FAISS version tag or commit (ignored when `FAISS_PREFIX` is set) |
+
+### SIMD optimization
+
+FAISS uses SIMD instructions for fast distance computation. By default it builds with `generic` (portable) code. Set `FAISS_OPT_LEVEL` to enable optimized codepaths for your CPU:
+
+| Value | Platform | Instructions |
+|-------|----------|-------------|
+| `generic` | Any | Portable, no special instructions |
+| `avx2` | x86-64 | AVX2 + FMA (most Intel/AMD since ~2015) |
+| `avx512` | x86-64 | AVX-512 (Intel Xeon, AMD Zen 4+) |
+| `sve` | aarch64 | SVE (ARM Neoverse V1+) |
+
+```bash
+# Build with AVX2 optimizations
+FAISS_OPT_LEVEL=avx2 mix compile
+
+# Force a fresh FAISS build after changing opt level
+rm -rf ~/.cache/faiss_ex && FAISS_OPT_LEVEL=avx2 mix compile
+```
+
+> **Note:** Apple Silicon (M1-M4) uses NEON which is always enabled — `FAISS_OPT_LEVEL` has no effect on ARM macOS.
 
 ## Usage
 

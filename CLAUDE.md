@@ -25,6 +25,7 @@ mix format           # Format code
 - macOS rpath: `install_name_tool -id @rpath/libfaiss.dylib` (no `lib/` prefix — avoids double lib/ in path)
 - `Mix.Project.app_path()` cannot be called in `make_env/0` — `elixir_make` sets `MIX_APP_PATH` automatically
 - FAISS is cloned to `~/.cache/faiss_ex/faiss-<rev>/` and built in-tree (`build/` subdir)
+- `FAISS_PREFIX` env var: when set, uses system-installed FAISS instead of building from source
 
 ## Architecture
 

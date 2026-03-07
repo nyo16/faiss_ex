@@ -1,14 +1,16 @@
 # FaissEx NIF Build
 #
 # Environment variables (set via mix.exs make_env):
-#   FAISS_GIT_REPO - FAISS git repository URL
-#   FAISS_GIT_REV  - FAISS git revision/tag to build
+#   FAISS_PREFIX   - path to pre-installed FAISS (skips building from source)
+#   FAISS_GIT_REPO - FAISS git repository URL (ignored when FAISS_PREFIX is set)
+#   FAISS_GIT_REV  - FAISS git revision/tag to build (ignored when FAISS_PREFIX is set)
 #   USE_CUDA       - "true" to enable GPU support
 #   MIX_APP_PATH   - set by elixir_make
 
 FAISS_GIT_REPO ?= https://github.com/facebookresearch/faiss.git
 FAISS_GIT_REV  ?= v1.10.0
 USE_CUDA       ?= false
+FAISS_OPT_LEVEL ?= generic
 
 # Paths
 CACHE_DIR    := $(HOME)/.cache/faiss_ex
@@ -36,7 +38,6 @@ endif
 CC ?= cc
 NIF_CFLAGS := -std=c11 -O2 -fPIC -Wall -Wextra -Wno-unused-parameter
 NIF_CFLAGS += -I$(ERTS_INCLUDE_DIR)
-NIF_CFLAGS += -I$(FAISS_SRC)
 
 NIF_LDFLAGS := -shared
 NIF_LDFLAGS += -L$(LIB_DIR)
@@ -54,12 +55,24 @@ ifeq ($(USE_CUDA),true)
   NIF_CFLAGS += -DFAISS_GPU_ENABLED
 endif
 
-# CMake flags
+# ========== System FAISS vs build from source ==========
+
+ifdef FAISS_PREFIX
+  # Use pre-installed FAISS: headers from FAISS_PREFIX/include, libs from FAISS_PREFIX/lib
+  NIF_CFLAGS += -I$(FAISS_PREFIX)/include
+  SYSTEM_LIB_DIR := $(FAISS_PREFIX)/lib
+else
+  # Build from source: headers from the cloned source tree
+  NIF_CFLAGS += -I$(FAISS_SRC)
+endif
+
+# CMake flags (only used when building from source)
 CMAKE_FLAGS := -DFAISS_ENABLE_C_API=ON
 CMAKE_FLAGS += -DFAISS_ENABLE_PYTHON=OFF
 CMAKE_FLAGS += -DBUILD_TESTING=OFF
 CMAKE_FLAGS += -DBUILD_SHARED_LIBS=ON
 CMAKE_FLAGS += -DCMAKE_BUILD_TYPE=Release
+CMAKE_FLAGS += -DFAISS_OPT_LEVEL=$(FAISS_OPT_LEVEL)
 
 ifeq ($(USE_CUDA),true)
   CMAKE_FLAGS += -DFAISS_ENABLE_GPU=ON
@@ -83,6 +96,37 @@ endif
 NIF_SO := $(PRIV_DIR)/libfaiss_ex.so
 
 .PHONY: all clean
+
+ifdef FAISS_PREFIX
+# ========== System FAISS path ==========
+
+all: $(NIF_SO)
+
+# Copy system libs to priv/lib/ so the NIF can find them at runtime
+$(LIB_DIR)/libfaiss.$(SHARED_EXT):
+	@echo "==> Copying system libfaiss from $(SYSTEM_LIB_DIR)..."
+	mkdir -p $(LIB_DIR)
+	cp $(SYSTEM_LIB_DIR)/libfaiss.$(SHARED_EXT) $@
+ifeq ($(UNAME_S),Darwin)
+	install_name_tool -id @rpath/libfaiss.$(SHARED_EXT) $@
+endif
+
+$(LIB_DIR)/libfaiss_c.$(SHARED_EXT): $(LIB_DIR)/libfaiss.$(SHARED_EXT)
+	@echo "==> Copying system libfaiss_c from $(SYSTEM_LIB_DIR)..."
+	mkdir -p $(LIB_DIR)
+	cp $(SYSTEM_LIB_DIR)/libfaiss_c.$(SHARED_EXT) $@
+ifeq ($(UNAME_S),Darwin)
+	install_name_tool -id @rpath/libfaiss_c.$(SHARED_EXT) $@
+	install_name_tool -change @rpath/libfaiss.$(SHARED_EXT) @loader_path/libfaiss.$(SHARED_EXT) $@
+endif
+
+$(NIF_SO): c_src/faiss_ex_nif.c $(LIB_DIR)/libfaiss_c.$(SHARED_EXT) $(LIB_DIR)/libfaiss.$(SHARED_EXT)
+	@echo "==> Compiling NIF (using system FAISS at $(FAISS_PREFIX))..."
+	mkdir -p $(PRIV_DIR)
+	$(CC) $(NIF_CFLAGS) $< -o $@ $(NIF_LDFLAGS)
+
+else
+# ========== Build from source path ==========
 
 all: $(NIF_SO)
 
@@ -132,6 +176,8 @@ $(NIF_SO): c_src/faiss_ex_nif.c $(LIB_DIR)/libfaiss_c.$(SHARED_EXT) $(LIB_DIR)/l
 	@echo "==> Compiling NIF..."
 	mkdir -p $(PRIV_DIR)
 	$(CC) $(NIF_CFLAGS) $< -o $@ $(NIF_LDFLAGS)
+
+endif
 
 clean:
 	rm -rf $(PRIV_DIR)/libfaiss_ex.so $(LIB_DIR)
