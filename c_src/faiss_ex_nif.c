@@ -103,10 +103,18 @@ static ERL_NIF_TERM make_faiss_error(ErlNifEnv *env, const char *fallback) {
     return make_error_msg(env, fallback);
 }
 
+/* Overflow-safe multiplication: returns 0 on overflow, 1 on success */
+static int safe_mul(size_t a, size_t b, size_t *result) {
+    if (a != 0 && b > SIZE_MAX / a) return 0;
+    *result = a * b;
+    return 1;
+}
+
 /* ========== NIF: Index ========== */
 
 /* nif_new_index(dim, description_binary, metric_int) */
 static ERL_NIF_TERM nif_new_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     int dim;
     ErlNifBinary desc_bin;
     int metric;
@@ -132,6 +140,10 @@ static ERL_NIF_TERM nif_new_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     }
 
     IndexResource *res = enif_alloc_resource(INDEX_RESOURCE_TYPE, sizeof(IndexResource));
+    if (!res) {
+        faiss_Index_free(index);
+        return make_error_msg(env, "failed to allocate resource");
+    }
     res->index = index;
     ERL_NIF_TERM ref = enif_make_resource(env, res);
     enif_release_resource(res);
@@ -141,6 +153,7 @@ static ERL_NIF_TERM nif_new_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
 
 /* nif_clone_index(ref) */
 static ERL_NIF_TERM nif_clone_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     IndexResource *res;
     if (!enif_get_resource(env, argv[0], INDEX_RESOURCE_TYPE, (void **)&res)) {
         return make_error_msg(env, "invalid index reference");
@@ -153,6 +166,10 @@ static ERL_NIF_TERM nif_clone_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     }
 
     IndexResource *new_res = enif_alloc_resource(INDEX_RESOURCE_TYPE, sizeof(IndexResource));
+    if (!new_res) {
+        faiss_Index_free(cloned);
+        return make_error_msg(env, "failed to allocate resource");
+    }
     new_res->index = cloned;
     ERL_NIF_TERM ref = enif_make_resource(env, new_res);
     enif_release_resource(new_res);
@@ -162,6 +179,7 @@ static ERL_NIF_TERM nif_clone_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
 
 /* nif_add_to_index(ref, n, data_binary) */
 static ERL_NIF_TERM nif_add_to_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     IndexResource *res;
     long n;
     ErlNifBinary data_bin;
@@ -172,8 +190,14 @@ static ERL_NIF_TERM nif_add_to_index(ErlNifEnv *env, int argc, const ERL_NIF_TER
         return make_error_msg(env, "invalid arguments");
     }
 
+    if (n < 0) return make_error_msg(env, "n must be non-negative");
+    if (n == 0) return make_ok_atom(env);
+
     int dim = faiss_Index_d(res->index);
-    size_t expected = (size_t)n * (size_t)dim * sizeof(float);
+    size_t nd, expected;
+    if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &expected)) {
+        return make_error_msg(env, "size overflow");
+    }
     if (data_bin.size != expected) {
         return make_error_msg(env, "data binary size mismatch");
     }
@@ -188,6 +212,7 @@ static ERL_NIF_TERM nif_add_to_index(ErlNifEnv *env, int argc, const ERL_NIF_TER
 
 /* nif_add_with_ids_to_index(ref, n, data_binary, ids_binary) */
 static ERL_NIF_TERM nif_add_with_ids_to_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     IndexResource *res;
     long n;
     ErlNifBinary data_bin, ids_bin;
@@ -199,9 +224,17 @@ static ERL_NIF_TERM nif_add_with_ids_to_index(ErlNifEnv *env, int argc, const ER
         return make_error_msg(env, "invalid arguments");
     }
 
+    if (n < 0) return make_error_msg(env, "n must be non-negative");
+    if (n == 0) return make_ok_atom(env);
+
     int dim = faiss_Index_d(res->index);
-    size_t expected_data = (size_t)n * (size_t)dim * sizeof(float);
-    size_t expected_ids = (size_t)n * sizeof(int64_t);
+    size_t nd, expected_data, expected_ids;
+    if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &expected_data)) {
+        return make_error_msg(env, "size overflow");
+    }
+    if (!safe_mul((size_t)n, sizeof(int64_t), &expected_ids)) {
+        return make_error_msg(env, "size overflow");
+    }
 
     if (data_bin.size != expected_data || ids_bin.size != expected_ids) {
         return make_error_msg(env, "binary size mismatch");
@@ -219,6 +252,7 @@ static ERL_NIF_TERM nif_add_with_ids_to_index(ErlNifEnv *env, int argc, const ER
 
 /* nif_search_index(ref, n, data_binary, k) */
 static ERL_NIF_TERM nif_search_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     IndexResource *res;
     long n, k;
     ErlNifBinary data_bin;
@@ -230,17 +264,31 @@ static ERL_NIF_TERM nif_search_index(ErlNifEnv *env, int argc, const ERL_NIF_TER
         return make_error_msg(env, "invalid arguments");
     }
 
+    if (n < 0) return make_error_msg(env, "n must be non-negative");
+    if (k <= 0) return make_error_msg(env, "k must be positive");
+
     int dim = faiss_Index_d(res->index);
-    size_t expected = (size_t)n * (size_t)dim * sizeof(float);
+    size_t nd, expected;
+    if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &expected)) {
+        return make_error_msg(env, "size overflow");
+    }
     if (data_bin.size != expected) {
         return make_error_msg(env, "data binary size mismatch");
     }
 
-    ErlNifBinary distances_bin, labels_bin;
-    size_t nk = (size_t)n * (size_t)k;
+    size_t nk, dist_size, label_size;
+    if (!safe_mul((size_t)n, (size_t)k, &nk) ||
+        !safe_mul(nk, sizeof(float), &dist_size) ||
+        !safe_mul(nk, sizeof(int64_t), &label_size)) {
+        return make_error_msg(env, "size overflow");
+    }
 
-    if (!enif_alloc_binary(nk * sizeof(float), &distances_bin) ||
-        !enif_alloc_binary(nk * sizeof(int64_t), &labels_bin)) {
+    ErlNifBinary distances_bin, labels_bin;
+    if (!enif_alloc_binary(dist_size, &distances_bin)) {
+        return make_error_msg(env, "failed to allocate result binaries");
+    }
+    if (!enif_alloc_binary(label_size, &labels_bin)) {
+        enif_release_binary(&distances_bin);
         return make_error_msg(env, "failed to allocate result binaries");
     }
 
@@ -262,6 +310,7 @@ static ERL_NIF_TERM nif_search_index(ErlNifEnv *env, int argc, const ERL_NIF_TER
 
 /* nif_train_index(ref, n, data_binary) */
 static ERL_NIF_TERM nif_train_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     IndexResource *res;
     long n;
     ErlNifBinary data_bin;
@@ -272,8 +321,14 @@ static ERL_NIF_TERM nif_train_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         return make_error_msg(env, "invalid arguments");
     }
 
+    if (n < 0) return make_error_msg(env, "n must be non-negative");
+    if (n == 0) return make_ok_atom(env);
+
     int dim = faiss_Index_d(res->index);
-    size_t expected = (size_t)n * (size_t)dim * sizeof(float);
+    size_t nd, expected;
+    if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &expected)) {
+        return make_error_msg(env, "size overflow");
+    }
     if (data_bin.size != expected) {
         return make_error_msg(env, "data binary size mismatch");
     }
@@ -288,6 +343,7 @@ static ERL_NIF_TERM nif_train_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
 
 /* nif_reset_index(ref) */
 static ERL_NIF_TERM nif_reset_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     IndexResource *res;
     if (!enif_get_resource(env, argv[0], INDEX_RESOURCE_TYPE, (void **)&res)) {
         return make_error_msg(env, "invalid index reference");
@@ -303,6 +359,7 @@ static ERL_NIF_TERM nif_reset_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
 
 /* nif_reconstruct_batch(ref, n, keys_binary) - loops over individual keys */
 static ERL_NIF_TERM nif_reconstruct_batch(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     IndexResource *res;
     long n;
     ErlNifBinary keys_bin;
@@ -313,13 +370,32 @@ static ERL_NIF_TERM nif_reconstruct_batch(ErlNifEnv *env, int argc, const ERL_NI
         return make_error_msg(env, "invalid arguments");
     }
 
-    if (keys_bin.size != (size_t)n * sizeof(int64_t)) {
+    if (n < 0) return make_error_msg(env, "n must be non-negative");
+
+    size_t expected_keys;
+    if (!safe_mul((size_t)n, sizeof(int64_t), &expected_keys)) {
+        return make_error_msg(env, "size overflow");
+    }
+    if (keys_bin.size != expected_keys) {
         return make_error_msg(env, "keys binary size mismatch");
     }
 
+    if (n == 0) {
+        ErlNifBinary empty;
+        if (!enif_alloc_binary(0, &empty)) {
+            return make_error_msg(env, "failed to allocate result binary");
+        }
+        return make_ok(env, enif_make_binary(env, &empty));
+    }
+
     int dim = faiss_Index_d(res->index);
+    size_t nd, result_size;
+    if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &result_size)) {
+        return make_error_msg(env, "size overflow");
+    }
+
     ErlNifBinary result_bin;
-    if (!enif_alloc_binary((size_t)n * (size_t)dim * sizeof(float), &result_bin)) {
+    if (!enif_alloc_binary(result_size, &result_bin)) {
         return make_error_msg(env, "failed to allocate result binary");
     }
 
@@ -339,6 +415,7 @@ static ERL_NIF_TERM nif_reconstruct_batch(ErlNifEnv *env, int argc, const ERL_NI
 
 /* nif_compute_residuals(ref, n, data_binary, keys_binary) */
 static ERL_NIF_TERM nif_compute_residuals(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     IndexResource *res;
     long n;
     ErlNifBinary data_bin, keys_bin;
@@ -350,12 +427,27 @@ static ERL_NIF_TERM nif_compute_residuals(ErlNifEnv *env, int argc, const ERL_NI
         return make_error_msg(env, "invalid arguments");
     }
 
+    if (n < 0) return make_error_msg(env, "n must be non-negative");
+
     int dim = faiss_Index_d(res->index);
-    size_t expected_data = (size_t)n * (size_t)dim * sizeof(float);
-    size_t expected_keys = (size_t)n * sizeof(int64_t);
+    size_t nd, expected_data, expected_keys;
+    if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &expected_data)) {
+        return make_error_msg(env, "size overflow");
+    }
+    if (!safe_mul((size_t)n, sizeof(int64_t), &expected_keys)) {
+        return make_error_msg(env, "size overflow");
+    }
 
     if (data_bin.size != expected_data || keys_bin.size != expected_keys) {
         return make_error_msg(env, "binary size mismatch");
+    }
+
+    if (n == 0) {
+        ErlNifBinary empty;
+        if (!enif_alloc_binary(0, &empty)) {
+            return make_error_msg(env, "failed to allocate result binary");
+        }
+        return make_ok(env, enif_make_binary(env, &empty));
     }
 
     ErlNifBinary result_bin;
@@ -383,6 +475,7 @@ static ERL_NIF_TERM nif_compute_residuals(ErlNifEnv *env, int argc, const ERL_NI
 
 /* nif_write_index(ref, path_binary) */
 static ERL_NIF_TERM nif_write_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     IndexResource *res;
     ErlNifBinary path_bin;
 
@@ -408,6 +501,7 @@ static ERL_NIF_TERM nif_write_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
 
 /* nif_read_index(path_binary, io_flags) */
 static ERL_NIF_TERM nif_read_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     ErlNifBinary path_bin;
     int io_flags;
 
@@ -430,6 +524,10 @@ static ERL_NIF_TERM nif_read_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     }
 
     IndexResource *res = enif_alloc_resource(INDEX_RESOURCE_TYPE, sizeof(IndexResource));
+    if (!res) {
+        faiss_Index_free(index);
+        return make_error_msg(env, "failed to allocate resource");
+    }
     res->index = index;
     ERL_NIF_TERM ref = enif_make_resource(env, res);
     enif_release_resource(res);
@@ -439,6 +537,7 @@ static ERL_NIF_TERM nif_read_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 
 /* nif_get_index_dim(ref) */
 static ERL_NIF_TERM nif_get_index_dim(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     IndexResource *res;
     if (!enif_get_resource(env, argv[0], INDEX_RESOURCE_TYPE, (void **)&res)) {
         return make_error_msg(env, "invalid index reference");
@@ -448,6 +547,7 @@ static ERL_NIF_TERM nif_get_index_dim(ErlNifEnv *env, int argc, const ERL_NIF_TE
 
 /* nif_get_index_ntotal(ref) */
 static ERL_NIF_TERM nif_get_index_ntotal(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     IndexResource *res;
     if (!enif_get_resource(env, argv[0], INDEX_RESOURCE_TYPE, (void **)&res)) {
         return make_error_msg(env, "invalid index reference");
@@ -457,6 +557,7 @@ static ERL_NIF_TERM nif_get_index_ntotal(ErlNifEnv *env, int argc, const ERL_NIF
 
 /* nif_get_index_is_trained(ref) */
 static ERL_NIF_TERM nif_get_index_is_trained(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     IndexResource *res;
     if (!enif_get_resource(env, argv[0], INDEX_RESOURCE_TYPE, (void **)&res)) {
         return make_error_msg(env, "invalid index reference");
@@ -471,6 +572,7 @@ static ERL_NIF_TERM nif_get_index_is_trained(ErlNifEnv *env, int argc, const ERL
 
 /* nif_index_cpu_to_gpu(ref, device) - returns {gpu_resources_ref, gpu_index_ref} */
 static ERL_NIF_TERM nif_index_cpu_to_gpu(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     IndexResource *res;
     int device;
 
@@ -494,11 +596,21 @@ static ERL_NIF_TERM nif_index_cpu_to_gpu(ErlNifEnv *env, int argc, const ERL_NIF
 
     GpuResourcesResource *gpu_res_resource = enif_alloc_resource(
         GPU_RESOURCES_RESOURCE_TYPE, sizeof(GpuResourcesResource));
+    if (!gpu_res_resource) {
+        faiss_Index_free(gpu_index);
+        faiss_StandardGpuResources_free(gpu_res);
+        return make_error_msg(env, "failed to allocate resource");
+    }
     gpu_res_resource->resources = gpu_res;
     ERL_NIF_TERM gpu_res_ref = enif_make_resource(env, gpu_res_resource);
     enif_release_resource(gpu_res_resource);
 
     IndexResource *gpu_idx_resource = enif_alloc_resource(INDEX_RESOURCE_TYPE, sizeof(IndexResource));
+    if (!gpu_idx_resource) {
+        faiss_Index_free(gpu_index);
+        /* gpu_res is owned by gpu_res_resource; env cleanup will free it */
+        return make_error_msg(env, "failed to allocate resource");
+    }
     gpu_idx_resource->index = gpu_index;
     ERL_NIF_TERM gpu_idx_ref = enif_make_resource(env, gpu_idx_resource);
     enif_release_resource(gpu_idx_resource);
@@ -508,6 +620,7 @@ static ERL_NIF_TERM nif_index_cpu_to_gpu(ErlNifEnv *env, int argc, const ERL_NIF
 
 /* nif_index_gpu_to_cpu(ref) */
 static ERL_NIF_TERM nif_index_gpu_to_cpu(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     IndexResource *res;
     if (!enif_get_resource(env, argv[0], INDEX_RESOURCE_TYPE, (void **)&res)) {
         return make_error_msg(env, "invalid index reference");
@@ -520,6 +633,10 @@ static ERL_NIF_TERM nif_index_gpu_to_cpu(ErlNifEnv *env, int argc, const ERL_NIF
     }
 
     IndexResource *new_res = enif_alloc_resource(INDEX_RESOURCE_TYPE, sizeof(IndexResource));
+    if (!new_res) {
+        faiss_Index_free(cpu_index);
+        return make_error_msg(env, "failed to allocate resource");
+    }
     new_res->index = cpu_index;
     ERL_NIF_TERM ref = enif_make_resource(env, new_res);
     enif_release_resource(new_res);
@@ -529,20 +646,28 @@ static ERL_NIF_TERM nif_index_gpu_to_cpu(ErlNifEnv *env, int argc, const ERL_NIF
 
 /* nif_get_num_gpus() */
 static ERL_NIF_TERM nif_get_num_gpus(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    (void)argv;
     return make_ok(env, enif_make_int(env, faiss_get_num_gpus()));
 }
 
 #else /* !FAISS_GPU_ENABLED */
 
 static ERL_NIF_TERM nif_index_cpu_to_gpu(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    (void)argv;
     return make_error_msg(env, "GPU support not compiled");
 }
 
 static ERL_NIF_TERM nif_index_gpu_to_cpu(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    (void)argv;
     return make_error_msg(env, "GPU support not compiled");
 }
 
 static ERL_NIF_TERM nif_get_num_gpus(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    (void)argv;
     return make_ok(env, enif_make_int(env, 0));
 }
 
@@ -552,6 +677,7 @@ static ERL_NIF_TERM nif_get_num_gpus(ErlNifEnv *env, int argc, const ERL_NIF_TER
 
 /* nif_new_clustering(d, k) */
 static ERL_NIF_TERM nif_new_clustering(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     int d, k;
     if (!enif_get_int(env, argv[0], &d) ||
         !enif_get_int(env, argv[1], &k)) {
@@ -565,6 +691,10 @@ static ERL_NIF_TERM nif_new_clustering(ErlNifEnv *env, int argc, const ERL_NIF_T
     }
 
     ClusteringResource *res = enif_alloc_resource(CLUSTERING_RESOURCE_TYPE, sizeof(ClusteringResource));
+    if (!res) {
+        faiss_Clustering_free(clustering);
+        return make_error_msg(env, "failed to allocate resource");
+    }
     res->clustering = clustering;
     ERL_NIF_TERM ref = enif_make_resource(env, res);
     enif_release_resource(res);
@@ -574,6 +704,7 @@ static ERL_NIF_TERM nif_new_clustering(ErlNifEnv *env, int argc, const ERL_NIF_T
 
 /* nif_train_clustering(clust_ref, n, data_binary, idx_ref) */
 static ERL_NIF_TERM nif_train_clustering(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     ClusteringResource *clust_res;
     long n;
     ErlNifBinary data_bin;
@@ -584,6 +715,17 @@ static ERL_NIF_TERM nif_train_clustering(ErlNifEnv *env, int argc, const ERL_NIF
         !enif_inspect_binary(env, argv[2], &data_bin) ||
         !enif_get_resource(env, argv[3], INDEX_RESOURCE_TYPE, (void **)&idx_res)) {
         return make_error_msg(env, "invalid arguments");
+    }
+
+    if (n <= 0) return make_error_msg(env, "n must be positive");
+
+    int d = faiss_Clustering_d(clust_res->clustering);
+    size_t nd, expected;
+    if (!safe_mul((size_t)n, (size_t)d, &nd) || !safe_mul(nd, sizeof(float), &expected)) {
+        return make_error_msg(env, "size overflow");
+    }
+    if (data_bin.size != expected) {
+        return make_error_msg(env, "data binary size mismatch");
     }
 
     int ret = faiss_Clustering_train(clust_res->clustering, (idx_t)n,
@@ -597,6 +739,7 @@ static ERL_NIF_TERM nif_train_clustering(ErlNifEnv *env, int argc, const ERL_NIF
 
 /* nif_get_clustering_centroids(clust_ref) - returns {k, d, centroids_binary} */
 static ERL_NIF_TERM nif_get_clustering_centroids(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     ClusteringResource *res;
     if (!enif_get_resource(env, argv[0], CLUSTERING_RESOURCE_TYPE, (void **)&res)) {
         return make_error_msg(env, "invalid clustering reference");
@@ -629,46 +772,48 @@ static ERL_NIF_TERM nif_get_clustering_centroids(ErlNifEnv *env, int argc, const
 
 /* ========== NIF Init ========== */
 
-static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
-    (void)priv_data;
-    (void)load_info;
-
+static int register_resource_types(ErlNifEnv *env, ErlNifResourceFlags flags) {
     INDEX_RESOURCE_TYPE = enif_open_resource_type(
-        env, NULL, "FaissIndex", index_resource_destructor, ERL_NIF_RT_CREATE, NULL);
+        env, NULL, "FaissIndex", index_resource_destructor, flags, NULL);
     if (!INDEX_RESOURCE_TYPE) return -1;
 
     CLUSTERING_RESOURCE_TYPE = enif_open_resource_type(
-        env, NULL, "FaissClustering", clustering_resource_destructor, ERL_NIF_RT_CREATE, NULL);
+        env, NULL, "FaissClustering", clustering_resource_destructor, flags, NULL);
     if (!CLUSTERING_RESOURCE_TYPE) return -1;
 
 #ifdef FAISS_GPU_ENABLED
     GPU_RESOURCES_RESOURCE_TYPE = enif_open_resource_type(
-        env, NULL, "FaissGpuResources", gpu_resources_destructor, ERL_NIF_RT_CREATE, NULL);
+        env, NULL, "FaissGpuResources", gpu_resources_destructor, flags, NULL);
     if (!GPU_RESOURCES_RESOURCE_TYPE) return -1;
 #endif
 
     return 0;
 }
 
+static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
+    (void)priv_data;
+    (void)load_info;
+    return register_resource_types(env, ERL_NIF_RT_CREATE);
+}
+
 static int on_upgrade(ErlNifEnv *env, void **priv_data, void **old_priv_data, ERL_NIF_TERM load_info) {
-    (void)env;
     (void)priv_data;
     (void)old_priv_data;
     (void)load_info;
-    return 0;
+    return register_resource_types(env, ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER);
 }
 
 static ErlNifFunc nif_funcs[] = {
     /* Index */
     {"nif_new_index", 3, nif_new_index, 0},
-    {"nif_clone_index", 1, nif_clone_index, 0},
+    {"nif_clone_index", 1, nif_clone_index, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_add_to_index", 3, nif_add_to_index, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_add_with_ids_to_index", 4, nif_add_with_ids_to_index, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_search_index", 4, nif_search_index, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_train_index", 3, nif_train_index, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_reset_index", 1, nif_reset_index, 0},
-    {"nif_reconstruct_batch", 3, nif_reconstruct_batch, 0},
-    {"nif_compute_residuals", 4, nif_compute_residuals, 0},
+    {"nif_reconstruct_batch", 3, nif_reconstruct_batch, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_compute_residuals", 4, nif_compute_residuals, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_write_index", 2, nif_write_index, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_read_index", 2, nif_read_index, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_get_index_dim", 1, nif_get_index_dim, 0},

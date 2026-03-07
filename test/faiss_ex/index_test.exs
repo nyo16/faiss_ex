@@ -372,6 +372,18 @@ defmodule FaissEx.IndexTest do
       assert Nx.to_flat_list(labels) == [-1, -1, -1]
     end
 
+    test "search with n=0 returns empty results via NIF" do
+      {:ok, index} = Index.new(4, "Flat")
+      :ok = Index.add(index, [[1.0, 0.0, 0.0, 0.0]])
+
+      # Call NIF directly with n=0 (empty query)
+      {:ok, {distances_bin, labels_bin}} =
+        FaissEx.NIF.nif_search_index(index.ref, 0, <<>>, 2)
+
+      assert byte_size(distances_bin) == 0
+      assert byte_size(labels_bin) == 0
+    end
+
     test "adding after reset works" do
       {:ok, index} = Index.new(3, "Flat")
       :ok = Index.add(index, [1.0, 0.0, 0.0])
