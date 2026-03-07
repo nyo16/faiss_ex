@@ -2,7 +2,7 @@
 
 Elixir NIF bindings for [FAISS](https://github.com/facebookresearch/faiss) — Facebook's library for efficient similarity search and clustering of dense vectors.
 
-Binds to FAISS via its official C API (`libfaiss_c`) and integrates with [Nx](https://github.com/elixir-nx/nx) tensors.
+Binds to FAISS via its official C API (`libfaiss_c`). No external dependencies beyond `elixir_make`.
 
 ## Features
 
@@ -54,13 +54,13 @@ Set these environment variables before `mix compile`:
 
 ## Usage
 
-All functions that accept vectors work with **Nx tensors**, **plain lists**, or **lists of lists**:
+All functions accept **plain lists** (single vector) or **lists of lists** (batch):
 
 ```elixir
-# All three are equivalent:
-FaissEx.Index.add(index, Nx.tensor([[1.0, 2.0, 3.0]], type: {:f, 32}))
+# Single vector
 FaissEx.Index.add(index, [1.0, 2.0, 3.0])
-FaissEx.Index.add(index, [[1.0, 2.0, 3.0]])
+# Batch of vectors
+FaissEx.Index.add(index, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
 ```
 
 ### Creating an index and searching
@@ -69,14 +69,13 @@ FaissEx.Index.add(index, [[1.0, 2.0, 3.0]])
 # Create a flat L2 index with 128 dimensions
 {:ok, index} = FaissEx.Index.new(128, "Flat")
 
-# Add vectors — Nx tensors or plain lists
-:ok = FaissEx.Index.add(index, some_nx_tensor)
+# Add vectors
 :ok = FaissEx.Index.add(index, [[0.1, 0.2, ...], [0.3, 0.4, ...]])
 
 # Search for 5 nearest neighbors
 {:ok, %{distances: distances, labels: labels}} = FaissEx.Index.search(index, query, 5)
-# distances: {n, 5} f32 tensor
-# labels: {n, 5} s64 tensor of vector indices
+# distances: [[float]] — n rows of k distances
+# labels: [[integer]] — n rows of k vector indices
 ```
 
 ### Index types
@@ -104,8 +103,8 @@ Some index types require training before adding vectors:
 ```elixir
 {:ok, index} = FaissEx.Index.new(128, "IVF256,Flat")
 
-# Train on representative data
-training_data = Nx.random_uniform({10_000, 128}, type: {:f, 32})
+# Train on representative data (list of lists)
+training_data = for _ <- 1..10_000, do: for(_ <- 1..128, do: :rand.uniform())
 :ok = FaissEx.Index.train(index, training_data)
 
 # Now add and search
@@ -118,8 +117,8 @@ training_data = Nx.random_uniform({10_000, 128}, type: {:f, 32})
 ```elixir
 {:ok, index} = FaissEx.Index.new(128, "IDMap,Flat")
 
-vectors = Nx.random_uniform({100, 128}, type: {:f, 32})
-ids = Nx.tensor(Enum.to_list(1000..1099), type: {:s, 64})
+vectors = for _ <- 1..100, do: for(_ <- 1..128, do: :rand.uniform())
+ids = Enum.to_list(1000..1099)
 :ok = FaissEx.Index.add_with_ids(index, vectors, ids)
 ```
 
@@ -148,9 +147,8 @@ ids = Nx.tensor(Enum.to_list(1000..1099), type: {:s, 64})
 ### Reconstructing vectors
 
 ```elixir
-keys = Nx.tensor([0, 5, 10], type: {:s, 64})
-{:ok, vectors} = FaissEx.Index.reconstruct(index, keys)
-# vectors: {3, dim} f32 tensor
+{:ok, vectors} = FaissEx.Index.reconstruct(index, [0, 5, 10])
+# vectors: [[float]] — 3 rows of dim floats
 ```
 
 ### Computing residuals
@@ -159,11 +157,10 @@ Compute the difference between vectors and their quantized reconstructions:
 
 ```elixir
 {:ok, index} = FaissEx.Index.new(4, "Flat")
-vectors = Nx.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], type: {:f, 32})
+vectors = [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]
 :ok = FaissEx.Index.add(index, vectors)
 
-keys = Nx.tensor([0, 1], type: {:s, 64})
-{:ok, residuals} = FaissEx.Index.compute_residuals(index, vectors, keys)
+{:ok, residuals} = FaissEx.Index.compute_residuals(index, vectors, [0, 1])
 # For a flat index, residuals are zero (exact reconstruction)
 ```
 
@@ -176,177 +173,42 @@ Search with multiple query vectors at once for better throughput:
 :ok = FaissEx.Index.add(index, corpus_vectors)
 
 # Search 100 queries at once
-queries = Nx.tensor(batch_of_queries, type: {:f, 32})  # {100, 128}
-{:ok, %{distances: distances, labels: labels}} = FaissEx.Index.search(index, queries, 10)
-# distances: {100, 10} - top 10 distances per query
-# labels: {100, 10} - top 10 vector IDs per query
+{:ok, %{distances: distances, labels: labels}} = FaissEx.Index.search(index, batch_of_queries, 10)
+# distances: [[float]] — 100 rows of 10 distances
+# labels: [[integer]] — 100 rows of 10 vector IDs
 ```
 
-## Example: Semantic Search with Bumblebee Embeddings
+## Example: Semantic Search with External Embeddings
 
-A complete example using [Bumblebee](https://github.com/elixir-nx/bumblebee) to generate sentence embeddings and FaissEx to search them.
-
-### Setup
-
-Add Bumblebee and an EXLA/Torchx backend to your deps:
-
-```elixir
-def deps do
-  [
-    {:faiss_ex, "~> 0.1.0"},
-    {:bumblebee, "~> 0.6"},
-    {:exla, "~> 0.9"}
-  ]
-end
-```
-
-### Building an embedding index
-
-```elixir
-# Load a sentence-transformers model
-{:ok, model_info} = Bumblebee.load_model({:hf, "sentence-transformers/all-MiniLM-L6-v2"})
-{:ok, tokenizer} = Bumblebee.load_tokenizer({:hf, "sentence-transformers/all-MiniLM-L6-v2"})
-
-serving = Bumblebee.Text.text_embedding(model_info, tokenizer,
-  compile: [batch_size: 32, sequence_length: 128],
-  defn_options: [compiler: EXLA]
-)
-
-# Your document corpus
-documents = [
-  "The cat sat on the mat",
-  "A dog played in the park",
-  "Elixir is a functional programming language",
-  "Phoenix is a web framework for Elixir",
-  "FAISS enables fast similarity search",
-  "Machine learning models generate embeddings",
-  "Vectors can represent semantic meaning",
-  "The quick brown fox jumps over the lazy dog"
-]
-
-# Generate embeddings for all documents
-embeddings =
-  documents
-  |> Enum.map(fn doc ->
-    %{embedding: embedding} = Nx.Serving.run(serving, doc)
-    embedding
-  end)
-  |> Nx.stack()
-
-# embeddings: {8, 384} f32 tensor (MiniLM outputs 384-dim vectors)
-{n, dim} = Nx.shape(embeddings)
-
-# Normalize for cosine similarity
-norms = Nx.LinAlg.norm(embeddings, axes: [1], keep_axes: true)
-normalized = Nx.divide(embeddings, norms)
-
-# Build the FAISS index
-{:ok, index} = FaissEx.Index.new(dim, "Flat", metric: :inner_product)
-:ok = FaissEx.Index.add(index, normalized)
-```
-
-### Querying
-
-```elixir
-# Embed the query
-query_text = "functional programming with Elixir"
-%{embedding: query_embedding} = Nx.Serving.run(serving, query_text)
-
-# Normalize
-query_norm = Nx.LinAlg.norm(query_embedding)
-query_normalized = Nx.divide(query_embedding, query_norm)
-
-# Search for top 3 most similar documents
-{:ok, %{distances: scores, labels: indices}} =
-  FaissEx.Index.search(index, query_normalized, 3)
-
-# Display results
-indices
-|> Nx.to_flat_list()
-|> Enum.zip(Nx.to_flat_list(scores))
-|> Enum.each(fn {idx, score} ->
-  IO.puts("#{Float.round(score, 4)} - #{Enum.at(documents, idx)}")
-end)
-
-# Output (similarity scores, higher = more similar):
-# 0.8234 - Elixir is a functional programming language
-# 0.7891 - Phoenix is a web framework for Elixir
-# 0.4012 - Machine learning models generate embeddings
-```
-
-### Scaling up with IVF
-
-For larger corpora (100K+ documents), use an IVF index:
-
-```elixir
-n_documents = length(documents)
-nlist = max(round(4 * :math.sqrt(n_documents)), 1)
-
-{:ok, index} = FaissEx.Index.new(dim, "IVF#{nlist},Flat", metric: :inner_product)
-
-# Train on your embeddings (or a representative sample)
-:ok = FaissEx.Index.train(index, normalized)
-:ok = FaissEx.Index.add(index, normalized)
-
-# Save for later use
-:ok = FaissEx.Index.to_file(index, "embeddings.index")
-```
-
-### Persistent search service
-
-A simple pattern for serving search in a Phoenix app:
-
-```elixir
-defmodule MyApp.SemanticSearch do
-  @index_path "priv/embeddings.index"
-
-  def load_index do
-    {:ok, index} = FaissEx.Index.from_file(@index_path)
-    index
-  end
-
-  def search(index, serving, query_text, k \\ 5) do
-    %{embedding: embedding} = Nx.Serving.run(serving, query_text)
-    norm = Nx.LinAlg.norm(embedding)
-    normalized = Nx.divide(embedding, norm)
-
-    {:ok, %{distances: scores, labels: indices}} =
-      FaissEx.Index.search(index, normalized, k)
-
-    Enum.zip(
-      Nx.to_flat_list(indices),
-      Nx.to_flat_list(scores)
-    )
-  end
-end
-```
-
-### Using OpenAI / other external embeddings
-
-If your embeddings come from an external API as lists of floats:
+FaissEx works with embeddings from any source — OpenAI, Cohere, Bumblebee, etc.
+Just pass them as lists of floats:
 
 ```elixir
 # Embeddings from any source (OpenAI, Cohere, Voyage, etc.)
-raw_embeddings = [
+embeddings = [
   [0.023, -0.041, 0.067, ...],  # 1536-dim for text-embedding-3-small
   [0.011, -0.032, 0.089, ...],
   # ...
 ]
 
-dim = length(hd(raw_embeddings))
-embeddings = Nx.tensor(raw_embeddings, type: {:f, 32})
+dim = length(hd(embeddings))
 
-# Normalize and index
-norms = Nx.LinAlg.norm(embeddings, axes: [1], keep_axes: true)
-normalized = Nx.divide(embeddings, norms)
+# For cosine similarity, normalize vectors to unit length first
+normalize = fn vec ->
+  norm = :math.sqrt(Enum.reduce(vec, 0.0, fn x, acc -> acc + x * x end))
+  Enum.map(vec, &(&1 / norm))
+end
+
+normalized = Enum.map(embeddings, normalize)
 
 {:ok, index} = FaissEx.Index.new(dim, "Flat", metric: :inner_product)
 :ok = FaissEx.Index.add(index, normalized)
 
-# Query with a new embedding from the same API
-query_embedding = Nx.tensor([query_floats], type: {:f, 32})
-query_normalized = Nx.divide(query_embedding, Nx.LinAlg.norm(query_embedding))
-{:ok, results} = FaissEx.Index.search(index, query_normalized, 10)
+# Query with a new embedding
+query = normalize.(query_floats)
+{:ok, %{distances: scores, labels: indices}} = FaissEx.Index.search(index, query, 10)
+# scores: [[float]] — similarity scores (higher = more similar)
+# indices: [[integer]] — vector IDs
 ```
 
 ## Choosing an Index
@@ -370,10 +232,9 @@ query_normalized = Nx.divide(query_embedding, Nx.LinAlg.norm(query_embedding))
 - **Cosine similarity**: Normalize your vectors to unit length first, then use `:inner_product` metric.
 
 ```elixir
-# Cosine similarity search
-normalized = Nx.divide(vectors, Nx.LinAlg.norm(vectors, axes: [1], keep_axes: true))
+# Cosine similarity search — normalize vectors to unit length, then use inner product
 {:ok, index} = FaissEx.Index.new(128, "Flat", metric: :inner_product)
-:ok = FaissEx.Index.add(index, normalized)
+:ok = FaissEx.Index.add(index, normalized_vectors)
 ```
 
 ### IDMap wrapper
@@ -385,8 +246,7 @@ FAISS indexes assign sequential IDs by default (0, 1, 2...). Wrap with `"IDMap,"
 {:ok, index} = FaissEx.Index.new(128, "IDMap,Flat")
 {:ok, index} = FaissEx.Index.new(128, "IDMap,HNSW32")
 
-ids = Nx.tensor([42, 99, 1337], type: {:s, 64})
-:ok = FaissEx.Index.add_with_ids(index, vectors, ids)
+:ok = FaissEx.Index.add_with_ids(index, vectors, [42, 99, 1337])
 
 {:ok, %{labels: labels}} = FaissEx.Index.search(index, query, 5)
 # labels now contain your custom IDs (42, 99, 1337...)
@@ -400,11 +260,11 @@ ids = Nx.tensor([42, 99, 1337], type: {:s, 64})
 # Cluster 128-dimensional vectors into 10 groups
 {:ok, clustering} = FaissEx.Clustering.new(128, 10)
 
-data = Nx.iota({5000, 128}, type: {:f, 32})
+data = for _ <- 1..5000, do: for(_ <- 1..128, do: :rand.uniform())
 {:ok, trained} = FaissEx.Clustering.train(clustering, data)
 
 {:ok, centroids} = FaissEx.Clustering.get_centroids(trained)
-# centroids: {10, 128} f32 tensor — center of each cluster
+# centroids: [[float]] — 10 rows of 128 floats, center of each cluster
 ```
 
 ### Assigning vectors to clusters
@@ -413,8 +273,8 @@ data = Nx.iota({5000, 128}, type: {:f, 32})
 # Which cluster does each vector belong to?
 {:ok, %{labels: labels, distances: distances}} =
   FaissEx.Clustering.get_cluster_assignment(trained, data)
-# labels: {5000, 1} s64 tensor of cluster IDs
-# distances: {5000, 1} f32 tensor of distances to nearest centroid
+# labels: [[integer]] — 5000 rows of 1 cluster ID each
+# distances: [[float]] — 5000 rows of 1 distance each
 ```
 
 ### Clustering for preprocessing
@@ -430,7 +290,9 @@ Use clustering to build an IVF quantizer or to reduce a dataset:
 
 # Filter to vectors within distance threshold
 threshold = 10.0
-mask = Nx.less(Nx.reshape(dists, {n}), threshold)
+nearby = Enum.zip(embeddings, List.flatten(dists))
+  |> Enum.filter(fn {_vec, dist} -> dist < threshold end)
+  |> Enum.map(&elem(&1, 0))
 ```
 
 ## Thread Safety
@@ -451,7 +313,7 @@ Elixir (FaissEx.Index) → NIF stubs (FaissEx.NIF) → C (faiss_ex_nif.c) → li
 - **Single C file**: All NIF code lives in `c_src/faiss_ex_nif.c`
 - **NIF resources**: FAISS index pointers are wrapped in NIF resource types with destructors, so BEAM GC handles cleanup
 - **No processes**: FaissEx uses plain functions and data — no GenServers or supervision trees
-- **Nx integration**: Vectors flow in/out as Nx tensors; binary data is passed directly to FAISS with zero copy where possible
+- **No dependencies**: Vectors flow in/out as plain lists; binary conversion happens in `FaissEx.Shared`
 
 ## Troubleshooting
 
@@ -543,6 +405,34 @@ This requires the CUDA toolkit to be installed. The build adds `-DFAISS_ENABLE_G
 
 ```bash
 USE_CUDA=true mix test --include cuda
+```
+
+## Benchmarks
+
+Measured on Apple M4 Max (16 cores, 64 GB RAM), Elixir 1.20.0-rc.1, OTP 28.3, FAISS v1.10.0.
+Index: 10,000 vectors, 128 dimensions, Flat L2.
+
+| Operation | ips | avg | median | 99th % |
+|-----------|-----|-----|--------|--------|
+| reconstruct 1 vector | 215.33 K | 4.64 μs | 4.75 μs | 11 μs |
+| add 1 vector | 133.28 K | 7.50 μs | 6.92 μs | 14.54 μs |
+| reconstruct 10 vectors | 23.57 K | 42.42 μs | 42.21 μs | 79.14 μs |
+| compute_residuals 1 vector | 17.00 K | 58.83 μs | 55.92 μs | 124.25 μs |
+| search k=10, 1 query | 12.05 K | 82.95 μs | 80.92 μs | 104.25 μs |
+| compute_residuals 10 vectors | 7.72 K | 129.46 μs | 124.46 μs | 217.88 μs |
+| search k=10, 10 queries | 5.13 K | 194.90 μs | 190.42 μs | 266.53 μs |
+| reconstruct 100 vectors | 1.89 K | 528.36 μs | 499.75 μs | 930.06 μs |
+| compute_residuals 100 vectors | 1.11 K | 903.15 μs | 866.35 μs | 1325.00 μs |
+| search k=10, 100 queries | 0.58 K | 1.72 ms | 1.72 ms | 1.96 ms |
+| add 1000 vectors | 0.38 K | 2.65 ms | 2.58 ms | 3.67 ms |
+| kmeans k=10, 1000 vectors | 0.108 K | 9.22 ms | 9.00 ms | 13.87 ms |
+| kmeans k=50, 1000 vectors | 0.098 K | 10.18 ms | 9.97 ms | 14.32 ms |
+| add 10000 vectors | 0.018 K | 56.52 ms | 55.05 ms | 71.46 ms |
+
+Run benchmarks yourself:
+
+```bash
+mix run bench/faiss_ex_bench.exs
 ```
 
 ## License
