@@ -318,6 +318,27 @@ defmodule FaissEx.IndexTest do
     end
   end
 
+  describe "input validation" do
+    test "rejects non-positive dimension" do
+      assert {:error, "dim must be positive"} = Index.new(0, "Flat")
+      assert {:error, "dim must be positive"} = Index.new(-4, "Flat")
+    end
+
+    test "rejects NUL byte in factory description" do
+      assert {:error, "string contains NUL byte"} = Index.new(4, <<"Flat", 0, "X">>)
+    end
+
+    test "rejects NUL byte in file paths" do
+      {:ok, index} = Index.new(4, "Flat")
+
+      assert {:error, "string contains NUL byte"} =
+               Index.to_file(index, <<"/tmp/bad", 0, "path">>)
+
+      assert {:error, "string contains NUL byte"} =
+               Index.from_file(<<"/tmp/bad", 0, "path">>)
+    end
+  end
+
   describe "get_num_gpus" do
     test "returns a non-negative integer" do
       {:ok, count} = FaissEx.NIF.nif_get_num_gpus()

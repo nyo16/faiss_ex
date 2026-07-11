@@ -46,6 +46,18 @@ defmodule FaissEx.ClusteringTest do
     end
   end
 
+  describe "input validation" do
+    test "rejects non-positive dimension" do
+      assert {:error, "d must be positive"} = Clustering.new(0, 4)
+      assert {:error, "d must be positive"} = Clustering.new(-1, 4)
+    end
+
+    test "rejects non-positive cluster count" do
+      assert {:error, "k must be positive"} = Clustering.new(8, 0)
+      assert {:error, "k must be positive"} = Clustering.new(8, -2)
+    end
+  end
+
   describe "edge cases" do
     test "untrained clustering returns error for assignment" do
       {:ok, clustering} = Clustering.new(4, 2)
