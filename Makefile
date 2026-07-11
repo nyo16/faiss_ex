@@ -8,7 +8,7 @@
 #   MIX_APP_PATH   - set by elixir_make
 
 FAISS_GIT_REPO ?= https://github.com/facebookresearch/faiss.git
-FAISS_GIT_REV  ?= v1.10.0
+FAISS_GIT_REV  ?= v1.14.3
 USE_CUDA       ?= false
 FAISS_OPT_LEVEL ?= generic
 
