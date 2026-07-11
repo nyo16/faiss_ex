@@ -1,16 +1,6 @@
 defmodule FaissEx.Shared do
   @moduledoc false
 
-  def unwrap!({:ok, result}), do: result
-
-  def unwrap!({:error, reason}) when is_binary(reason) do
-    raise RuntimeError, reason
-  end
-
-  def unwrap!({:error, reason}) do
-    raise RuntimeError, inspect(reason)
-  end
-
   @doc false
   def floats_to_binary(list) when is_list(list) do
     for f <- list, into: <<>>, do: <<f::float-32-native>>
@@ -32,11 +22,47 @@ defmodule FaissEx.Shared do
   end
 
   @doc false
-  def to_flat_floats([h | _] = list) when is_list(h) do
-    {length(list), List.flatten(list)}
+  @spec encode_vectors!([number()] | [[number()]], pos_integer()) ::
+          {non_neg_integer(), binary()}
+  def encode_vectors!(data, dim)
+
+  def encode_vectors!([row | _] = rows, dim) when is_list(row) do
+    encode_batch(rows, dim, 0, [])
   end
 
-  def to_flat_floats([_ | _] = list) do
-    {1, list}
+  def encode_vectors!([_ | _] = vector, dim) do
+    {1, encode_row!(vector, dim, 0)}
+  end
+
+  def encode_vectors!([], _dim), do: {0, <<>>}
+
+  defp encode_batch([], _dim, n, acc) do
+    {n, acc |> Enum.reverse() |> IO.iodata_to_binary()}
+  end
+
+  defp encode_batch([row | rest], dim, n, acc) when is_list(row) do
+    encode_batch(rest, dim, n + 1, [encode_row!(row, dim, n) | acc])
+  end
+
+  defp encode_batch([bad | _], _dim, n, _acc) do
+    raise ArgumentError, "row #{n} is not a list of numbers: #{inspect(bad)}"
+  end
+
+  defp encode_row!(row, dim, row_index), do: encode_row(row, dim, row_index, 0, <<>>)
+
+  defp encode_row([], dim, row_index, count, acc) do
+    if count == dim do
+      acc
+    else
+      raise ArgumentError, "row #{row_index} has #{count} elements, expected #{dim}"
+    end
+  end
+
+  defp encode_row([f | rest], dim, row_index, count, acc) when is_number(f) do
+    encode_row(rest, dim, row_index, count + 1, <<acc::binary, f::float-32-native>>)
+  end
+
+  defp encode_row([bad | _], _dim, row_index, _count, _acc) do
+    raise ArgumentError, "row #{row_index} contains a non-number: #{inspect(bad)}"
   end
 end

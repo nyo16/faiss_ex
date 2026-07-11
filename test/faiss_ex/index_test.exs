@@ -246,7 +246,57 @@ defmodule FaissEx.IndexTest do
     end
   end
 
+  describe "GPU error paths (non-CUDA build)" do
+    @tag :no_cuda
+    test "cpu_to_gpu without GPU support returns error" do
+      {:ok, index} = Index.new(4, "Flat")
+      assert {:error, "GPU support not compiled"} = Index.cpu_to_gpu(index, 0)
+    end
+
+    test "cpu_to_gpu on an index already on GPU returns error" do
+      {:ok, index} = Index.new(4, "Flat")
+      gpu_index = %Index{index | device: {:cuda, 0}}
+      assert {:error, "index already on GPU"} = Index.cpu_to_gpu(gpu_index, 0)
+    end
+  end
+
+  describe "file I/O error paths" do
+    test "to_file into a nonexistent directory returns error" do
+      {:ok, index} = Index.new(4, "Flat")
+      assert {:error, _} = Index.to_file(index, "/nonexistent_dir_faiss_ex/x.index")
+    end
+
+    test "from_file on a nonexistent path returns error" do
+      assert {:error, _} = Index.from_file("/nonexistent_dir_faiss_ex/missing.index")
+    end
+
+    test "from_file sets description to nil" do
+      {:ok, index} = Index.new(4, "Flat")
+      :ok = Index.add(index, [[1.0, 2.0, 3.0, 4.0]])
+      path = Path.join(System.tmp_dir!(), "faiss_ex_desc_#{:rand.uniform(100_000)}.index")
+
+      try do
+        :ok = Index.to_file(index, path)
+        {:ok, loaded} = Index.from_file(path)
+        assert loaded.description == nil
+      after
+        File.rm(path)
+      end
+    end
+  end
+
   describe "edge cases" do
+    test "search with k greater than ntotal pads labels with -1" do
+      {:ok, index} = Index.new(3, "Flat")
+      :ok = Index.add(index, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+
+      {:ok, %{labels: [labels_row]}} = Index.search(index, [1.0, 0.0, 0.0], 5)
+
+      assert length(labels_row) == 5
+      assert Enum.take(labels_row, 2) == [0, 1]
+      assert Enum.drop(labels_row, 2) == [-1, -1, -1]
+    end
+
     test "search returns -1 labels when index is empty" do
       {:ok, index} = Index.new(4, "Flat")
       {:ok, %{labels: [labels_row]}} = Index.search(index, [0.0, 0.0, 0.0, 0.0], 3)
@@ -319,6 +369,28 @@ defmodule FaissEx.IndexTest do
   end
 
   describe "input validation" do
+    test "raises on invalid metric" do
+      assert_raise ArgumentError,
+                   "invalid metric :cosine, expected :l2 or :inner_product",
+                   fn -> Index.new(4, "Flat", metric: :cosine) end
+    end
+
+    test "raises on ragged batch with the offending row index" do
+      {:ok, index} = Index.new(3, "Flat")
+
+      assert_raise ArgumentError, "row 1 has 2 elements, expected 3", fn ->
+        Index.add(index, [[1.0, 2.0, 3.0], [1.0, 2.0]])
+      end
+    end
+
+    test "raises on short single vector" do
+      {:ok, index} = Index.new(3, "Flat")
+
+      assert_raise ArgumentError, "row 0 has 2 elements, expected 3", fn ->
+        Index.add(index, [1.0, 2.0])
+      end
+    end
+
     test "rejects non-positive dimension" do
       assert {:error, "dim must be positive"} = Index.new(0, "Flat")
       assert {:error, "dim must be positive"} = Index.new(-4, "Flat")
@@ -339,9 +411,9 @@ defmodule FaissEx.IndexTest do
     end
   end
 
-  describe "get_num_gpus" do
-    test "returns a non-negative integer" do
-      {:ok, count} = FaissEx.NIF.nif_get_num_gpus()
+  describe "num_gpus" do
+    test "FaissEx.num_gpus/0 returns a non-negative integer" do
+      count = FaissEx.num_gpus()
       assert is_integer(count) and count >= 0
     end
   end

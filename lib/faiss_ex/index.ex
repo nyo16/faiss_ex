@@ -42,15 +42,29 @@ defmodule FaissEx.Index do
 
   defstruct [:dim, :ref, :device, :description, :gpu_resources_ref]
 
+  @typedoc """
+  Handle to a FAISS index.
+
+    * `:dim` — vector dimension the index was created with
+    * `:ref` — NIF resource reference (freed by the BEAM GC)
+    * `:device` — `:host` or `{:cuda, device_id}`
+    * `:description` — factory string the index was built from, or `nil`
+      when loaded from a file
+    * `:gpu_resources_ref` — NIF resource backing a GPU index, `nil` on host
+  """
   @type t :: %__MODULE__{
           dim: pos_integer(),
           ref: reference(),
           device: :host | {:cuda, non_neg_integer()},
-          description: String.t(),
+          description: String.t() | nil,
           gpu_resources_ref: reference() | nil
         }
 
-  @metric_map %{l2: 1, inner_product: 0}
+  @typedoc "A single vector as a flat list, or a batch as a list of vectors."
+  @type vectors :: [number()] | [[number()]]
+
+  @typedoc "Error reason reported by FAISS or the NIF layer."
+  @type error :: {:error, String.t()}
 
   @doc """
   Creates a new FAISS index using the index factory.
@@ -66,11 +80,24 @@ defmodule FaissEx.Index do
       iex> index.dim
       128
   """
+  @spec new(pos_integer(), String.t(), keyword()) :: {:ok, t()} | error()
   def new(dim, description, opts \\ []) do
     metric = Keyword.get(opts, :metric, :l2)
     device = Keyword.get(opts, :device, :host)
 
-    metric_int = Map.fetch!(@metric_map, metric)
+    metric_int =
+      case metric do
+        :l2 ->
+          1
+
+        :inner_product ->
+          0
+
+        other ->
+          raise ArgumentError,
+                "invalid metric #{inspect(other)}, expected :l2 or :inner_product"
+      end
+
     desc_bin = to_binary(description)
 
     with {:ok, ref} <- NIF.nif_new_index(dim, desc_bin, metric_int) do
@@ -92,16 +119,16 @@ defmodule FaissEx.Index do
   Adds vectors to the index.
 
   Accepts a flat list of floats (single vector) or a list of lists (batch).
+  Raises `ArgumentError` if any vector does not have `dim` elements.
 
   ## Examples
 
       :ok = FaissEx.Index.add(index, [1.0, 2.0, 3.0])
       :ok = FaissEx.Index.add(index, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
   """
+  @spec add(t(), vectors()) :: :ok | error()
   def add(%__MODULE__{ref: ref, dim: dim}, data) when is_list(data) do
-    {n, flat} = Shared.to_flat_floats(data)
-    validate_length!(flat, n * dim, dim)
-    bin = Shared.floats_to_binary(flat)
+    {n, bin} = Shared.encode_vectors!(data, dim)
 
     case NIF.nif_add_to_index(ref, n, bin) do
       :ok -> :ok
@@ -116,11 +143,10 @@ defmodule FaissEx.Index do
 
       :ok = FaissEx.Index.add_with_ids(index, [[1.0, 2.0]], [100])
   """
+  @spec add_with_ids(t(), vectors(), [integer()]) :: :ok | error()
   def add_with_ids(%__MODULE__{ref: ref, dim: dim}, data, ids)
       when is_list(data) and is_list(ids) do
-    {n, flat} = Shared.to_flat_floats(data)
-    validate_length!(flat, n * dim, dim)
-    data_bin = Shared.floats_to_binary(flat)
+    {n, data_bin} = Shared.encode_vectors!(data, dim)
     ids_bin = Shared.int64s_to_binary(ids)
 
     case NIF.nif_add_with_ids_to_index(ref, n, data_bin, ids_bin) do
@@ -133,11 +159,14 @@ defmodule FaissEx.Index do
   Searches the index for the `k` nearest neighbors.
 
   Returns `{:ok, %{distances: [[float]], labels: [[integer]]}}`.
+
+  When `k` exceeds the number of indexed vectors, FAISS pads the missing
+  positions with label `-1` (and an implementation-defined distance).
   """
+  @spec search(t(), vectors(), pos_integer()) ::
+          {:ok, %{distances: [[float()]], labels: [[integer()]]}} | error()
   def search(%__MODULE__{ref: ref, dim: dim}, data, k) when is_list(data) do
-    {n, flat} = Shared.to_flat_floats(data)
-    validate_length!(flat, n * dim, dim)
-    data_bin = Shared.floats_to_binary(flat)
+    {n, data_bin} = Shared.encode_vectors!(data, dim)
 
     case NIF.nif_search_index(ref, n, data_bin, k) do
       {:ok, {distances_bin, labels_bin}} ->
@@ -153,10 +182,9 @@ defmodule FaissEx.Index do
   @doc """
   Trains the index (required for IVF, PQ, etc.).
   """
+  @spec train(t(), vectors()) :: :ok | error()
   def train(%__MODULE__{ref: ref, dim: dim}, data) when is_list(data) do
-    {n, flat} = Shared.to_flat_floats(data)
-    validate_length!(flat, n * dim, dim)
-    bin = Shared.floats_to_binary(flat)
+    {n, bin} = Shared.encode_vectors!(data, dim)
 
     case NIF.nif_train_index(ref, n, bin) do
       :ok -> :ok
@@ -167,6 +195,7 @@ defmodule FaissEx.Index do
   @doc """
   Deep-copies the index.
   """
+  @spec clone(t()) :: {:ok, t()} | error()
   def clone(%__MODULE__{} = index) do
     case NIF.nif_clone_index(index.ref) do
       {:ok, new_ref} ->
@@ -180,6 +209,7 @@ defmodule FaissEx.Index do
   @doc """
   Removes all vectors from the index.
   """
+  @spec reset(t()) :: :ok | error()
   def reset(%__MODULE__{ref: ref}) do
     case NIF.nif_reset_index(ref) do
       :ok -> :ok
@@ -193,6 +223,7 @@ defmodule FaissEx.Index do
   `keys` is a list of integer indices.
   Returns `{:ok, [[float]]}` with shape n * dim.
   """
+  @spec reconstruct(t(), [integer()]) :: {:ok, [[float()]]} | error()
   def reconstruct(%__MODULE__{ref: ref, dim: dim}, keys) when is_list(keys) do
     n = length(keys)
     keys_bin = Shared.int64s_to_binary(keys)
@@ -211,11 +242,10 @@ defmodule FaissEx.Index do
 
   Returns `{:ok, [[float]]}`.
   """
+  @spec compute_residuals(t(), vectors(), [integer()]) :: {:ok, [[float()]]} | error()
   def compute_residuals(%__MODULE__{ref: ref, dim: dim}, xs, keys)
       when is_list(xs) and is_list(keys) do
-    {n, flat} = Shared.to_flat_floats(xs)
-    validate_length!(flat, n * dim, dim)
-    data_bin = Shared.floats_to_binary(flat)
+    {n, data_bin} = Shared.encode_vectors!(xs, dim)
     keys_bin = Shared.int64s_to_binary(keys)
 
     case NIF.nif_compute_residuals(ref, n, data_bin, keys_bin) do
@@ -230,6 +260,7 @@ defmodule FaissEx.Index do
   @doc """
   Writes the index to a file.
   """
+  @spec to_file(t(), String.t()) :: :ok | error()
   def to_file(%__MODULE__{ref: ref}, path) do
     case NIF.nif_write_index(ref, to_binary(path)) do
       :ok -> :ok
@@ -240,10 +271,14 @@ defmodule FaissEx.Index do
   @doc """
   Reads an index from a file.
 
+  The returned struct has `description: nil` — the factory string used to
+  build the index is not stored in the file format.
+
   ## Options
 
     * `:io_flags` - FAISS IO flags (default `0`)
   """
+  @spec from_file(String.t(), keyword()) :: {:ok, t()} | error()
   def from_file(path, opts \\ []) do
     io_flags = Keyword.get(opts, :io_flags, 0)
 
@@ -256,7 +291,7 @@ defmodule FaissEx.Index do
            dim: dim,
            ref: ref,
            device: :host,
-           description: "from_file"
+           description: nil
          }}
 
       {:error, _} = err ->
@@ -265,16 +300,19 @@ defmodule FaissEx.Index do
   end
 
   @doc "Returns the total number of indexed vectors."
+  @spec ntotal(t()) :: {:ok, non_neg_integer()} | error()
   def ntotal(%__MODULE__{ref: ref}) do
     NIF.nif_get_index_ntotal(ref)
   end
 
   @doc "Returns the dimension of the index."
+  @spec dim(t()) :: {:ok, pos_integer()} | error()
   def dim(%__MODULE__{ref: ref}) do
     NIF.nif_get_index_dim(ref)
   end
 
   @doc "Returns whether the index is trained."
+  @spec trained?(t()) :: {:ok, boolean()} | error()
   def trained?(%__MODULE__{ref: ref}) do
     case NIF.nif_get_index_is_trained(ref) do
       {:ok, val} -> {:ok, val}
@@ -284,8 +322,13 @@ defmodule FaissEx.Index do
 
   @doc """
   Moves a CPU index to GPU.
+
+  Returns `{:error, "index already on GPU"}` if the index is already there.
   """
-  def cpu_to_gpu(%__MODULE__{device: :host} = index, device_id \\ 0) do
+  @spec cpu_to_gpu(t(), non_neg_integer()) :: {:ok, t()} | error()
+  def cpu_to_gpu(index, device_id \\ 0)
+
+  def cpu_to_gpu(%__MODULE__{device: :host} = index, device_id) do
     case NIF.nif_index_cpu_to_gpu(index.ref, device_id) do
       {:ok, {gpu_res_ref, gpu_idx_ref}} ->
         {:ok,
@@ -301,9 +344,14 @@ defmodule FaissEx.Index do
     end
   end
 
+  def cpu_to_gpu(%__MODULE__{device: {:cuda, _}}, _device_id) do
+    {:error, "index already on GPU"}
+  end
+
   @doc """
   Moves a GPU index back to CPU.
   """
+  @spec gpu_to_cpu(t()) :: {:ok, t()} | error()
   def gpu_to_cpu(%__MODULE__{device: {:cuda, _}} = index) do
     case NIF.nif_index_gpu_to_cpu(index.ref) do
       {:ok, cpu_ref} ->
@@ -317,15 +365,6 @@ defmodule FaissEx.Index do
 
       {:error, _} = err ->
         err
-    end
-  end
-
-  defp validate_length!(flat, expected, dim) do
-    actual = length(flat)
-
-    if actual != expected do
-      raise ArgumentError,
-            "expected #{expected} floats (n * #{dim}), got #{actual}"
     end
   end
 

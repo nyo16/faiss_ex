@@ -44,6 +44,35 @@ defmodule FaissEx.ClusteringTest do
       assert length(distances) == 1
       assert length(hd(distances)) == 1
     end
+
+    test "train populates the quantizer with k centroids and reuses it" do
+      {:ok, clustering} = Clustering.new(4, 2)
+
+      data =
+        List.duplicate([1.0, 0.0, 0.0, 0.0], 50) ++
+          List.duplicate([0.0, 0.0, 0.0, 1.0], 50)
+
+      {:ok, trained} = Clustering.train(clustering, data)
+
+      # FAISS Clustering::train adds the k centroids to the quantizer index
+      assert {:ok, 2} = FaissEx.Index.ntotal(trained.index)
+
+      # The assigned label must match the argmin over centroid L2 distances
+      {:ok, centroids} = Clustering.get_centroids(trained)
+      query = [1.0, 0.0, 0.0, 0.0]
+
+      expected_label =
+        centroids
+        |> Enum.map(fn c ->
+          Enum.zip(c, query) |> Enum.map(fn {a, b} -> (a - b) * (a - b) end) |> Enum.sum()
+        end)
+        |> Enum.with_index()
+        |> Enum.min()
+        |> elem(1)
+
+      {:ok, %{labels: [[label]]}} = Clustering.get_cluster_assignment(trained, [query])
+      assert label == expected_label
+    end
   end
 
   describe "input validation" do
