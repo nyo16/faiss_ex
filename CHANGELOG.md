@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.3.0 (2026-07-12)
+
+Binary fast-path API and encode/decode optimizations.
+
+### Added
+
+- **Binary API.** Vectors already held as raw `f32-native` binaries (HTTP
+  responses, database blobs, files) can skip list encoding/decoding
+  entirely — adding 10,000×128 vectors drops from ~14.4 ms to ~0.35 ms.
+  - `add/2`, `train/2`, and `add_with_ids/3` accept row-major `f32-native`
+    vector binaries and `s64-native` ID binaries anywhere they accept
+    lists (mixing forms is fine); the vector count is inferred from
+    `byte_size`, and a non-divisible binary raises `ArgumentError`.
+  - `search_binary/3` and `reconstruct_binary/2` return raw result
+    binaries for zero-decode pipelines. The list-returning functions never
+    change shape based on input type.
+
+### Changed
+
+- `dim/1` no longer takes the index lock and runs on a normal scheduler —
+  the dimension is cached in the NIF resource at creation (it is immutable
+  in FAISS). `ntotal/1` and `trained?/1` still read live state under the
+  lock on dirty schedulers.
+- Search result decoding is single-pass per row (no flat-decode-then-chunk),
+  and the NIF's search critical section no longer covers size checks or
+  result allocation — the lock is held only for the FAISS call.
+
 ## v0.2.0 (2026-07-11)
 
 FAISS upgrade, thread safety, and performance fixes.

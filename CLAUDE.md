@@ -37,10 +37,10 @@ Elixir (FaissEx.Index / FaissEx.Clustering)
 ```
 
 **Key modules:**
-- `lib/faiss_ex/index.ex` — Index struct and all index operations (new, add, search, train, clone, reset, reconstruct, file I/O, GPU transfer). Accepts flat lists (single vector) or lists of lists (batch).
+- `lib/faiss_ex/index.ex` — Index struct and all index operations (new, add, search, train, clone, reset, reconstruct, file I/O, GPU transfer). Accepts flat lists (single vector), lists of lists (batch), or raw f32-native binaries (Binary API: add/train/add_with_ids take binary input; `search_binary/3` and `reconstruct_binary/2` return raw binaries).
 - `lib/faiss_ex/clustering.ex` — K-means clustering (new, train, get_centroids, get_cluster_assignment). Training creates a Flat quantizer index that FAISS populates with the centroids; `get_cluster_assignment/2` searches that same quantizer (do not rebuild it).
 - `lib/faiss_ex/nif.ex` — Raw NIF function stubs. All functions prefixed `nif_`. Returns `{:ok, result}`, `:ok`, or `{:error, binary_message}`.
-- `lib/faiss_ex/shared.ex` — `encode_vectors!/2` (single-pass list→f32 binary with per-row dim validation, raises ArgumentError) plus decode helpers (`binary_to_floats`, `int64s_to_binary`, `binary_to_int64s`).
+- `lib/faiss_ex/shared.ex` — `encode_vectors!/2` (single-pass list→f32 binary with per-row dim validation, raises ArgumentError; a flat-accumulator rewrite measured 2.4× slower — keep the per-row iodata design), `encode_ids!/1` (single-pass id list→{n, s64 binary}), single-pass row decoders (`binary_to_float_rows/2`, `binary_to_int64_rows/2`) plus flat decode helpers (`binary_to_floats`, `int64s_to_binary`, `binary_to_int64s`).
 - `c_src/faiss_ex_nif.c` — Single C file with all NIF implementations. Uses NIF resource types with destructors for index/clustering/GPU resource lifecycle.
 
 **NIF resource types:** `FaissIndex`, `FaissClustering`, `FaissGpuResources` (when `FAISS_GPU_ENABLED`). BEAM GC handles cleanup via destructors.
@@ -49,7 +49,7 @@ Elixir (FaissEx.Index / FaissEx.Clustering)
 
 **Dirty schedulers:** add, add_with_ids, search, train, reset, reconstruct, residuals, clone, centroids, and the ntotal/is_trained getters → `DIRTY_JOB_CPU_BOUND`; write/read index, GPU transfer → `DIRTY_JOB_IO_BOUND`. `nif_new_index`, `nif_new_clustering`, `nif_get_num_gpus`, and `nif_get_index_dim` (immutable cached field, no lock) stay on normal schedulers.
 
-**Data flow:** Elixir encodes lists to f32/s64 binaries via `Shared` → passed to NIF → NIF returns raw binaries → Elixir decodes back to lists.
+**Data flow:** Elixir encodes lists to f32/s64 binaries via `Shared` → passed to NIF → NIF returns raw binaries → Elixir decodes back to lists. The Binary API skips both conversions: binary input passes through after a byte-size divisibility check; `*_binary` functions return the NIF binaries as-is.
 
 ## Test Tags
 
