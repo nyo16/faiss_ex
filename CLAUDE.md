@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Elixir NIF bindings for FAISS (Facebook AI Similarity Search) via the C API (`libfaiss_c`). No external dependencies beyond `elixir_make`. Supports vector similarity search (L2, inner product), index factory, k-means clustering, and optional CUDA GPU support (CUDA 12.x required). FAISS is pinned at v1.14.3 via `FAISS_GIT_REV` — defined in BOTH `Makefile` and `mix.exs` (`make_env/0`); keep them in sync.
+Elixir NIF bindings for FAISS (Facebook AI Similarity Search) via the C API (`libfaiss_c`). No external dependencies beyond `elixir_make`. Supports vector similarity search (L2, inner product), index factory, k-means clustering, and optional CUDA GPU support (CUDA 12.x required). FAISS is pinned at v1.14.3 via `FAISS_GIT_REV`, with `FAISS_GIT_SHA` holding the commit the tag must resolve to (verified post-clone; tags are mutable refs) — both are defined in BOTH `Makefile` and `mix.exs` (`make_env/0`); keep them in sync.
 
 ## Build & Test Commands
 
