@@ -165,20 +165,17 @@ defmodule FaissEx.IndexTest do
   end
 
   describe "to_file/2 and from_file/1" do
-    test "round-trips an index through a file" do
+    @tag :tmp_dir
+    test "round-trips an index through a file", %{tmp_dir: tmp_dir} do
       {:ok, index} = Index.new(4, "Flat")
       :ok = Index.add(index, [[1.0, 2.0, 3.0, 4.0]])
 
-      path = Path.join(System.tmp_dir!(), "faiss_ex_test_#{:rand.uniform(100_000)}.index")
+      path = Path.join(tmp_dir, "roundtrip.index")
 
-      try do
-        assert :ok = Index.to_file(index, path)
-        assert {:ok, loaded} = Index.from_file(path)
-        assert {:ok, 1} = Index.ntotal(loaded)
-        assert loaded.dim == 4
-      after
-        File.rm(path)
-      end
+      assert :ok = Index.to_file(index, path)
+      assert {:ok, loaded} = Index.from_file(path)
+      assert {:ok, 1} = Index.ntotal(loaded)
+      assert loaded.dim == 4
     end
   end
 
@@ -290,18 +287,15 @@ defmodule FaissEx.IndexTest do
       assert {:error, _} = Index.from_file("/nonexistent_dir_faiss_ex/missing.index")
     end
 
-    test "from_file sets description to nil" do
+    @tag :tmp_dir
+    test "from_file sets description to nil", %{tmp_dir: tmp_dir} do
       {:ok, index} = Index.new(4, "Flat")
       :ok = Index.add(index, [[1.0, 2.0, 3.0, 4.0]])
-      path = Path.join(System.tmp_dir!(), "faiss_ex_desc_#{:rand.uniform(100_000)}.index")
+      path = Path.join(tmp_dir, "desc.index")
 
-      try do
-        :ok = Index.to_file(index, path)
-        {:ok, loaded} = Index.from_file(path)
-        assert loaded.description == nil
-      after
-        File.rm(path)
-      end
+      :ok = Index.to_file(index, path)
+      {:ok, loaded} = Index.from_file(path)
+      assert loaded.description == nil
     end
   end
 
@@ -346,7 +340,8 @@ defmodule FaissEx.IndexTest do
       assert {:ok, 2} = Index.ntotal(index)
     end
 
-    test "file round-trip preserves search results" do
+    @tag :tmp_dir
+    test "file round-trip preserves search results", %{tmp_dir: tmp_dir} do
       {:ok, index} = Index.new(3, "Flat")
 
       :ok =
@@ -356,19 +351,15 @@ defmodule FaissEx.IndexTest do
           [0.0, 0.0, 1.0]
         ])
 
-      path = Path.join(System.tmp_dir!(), "faiss_ex_roundtrip_#{:rand.uniform(100_000)}.index")
+      path = Path.join(tmp_dir, "search-roundtrip.index")
 
-      try do
-        :ok = Index.to_file(index, path)
-        {:ok, loaded} = Index.from_file(path)
+      :ok = Index.to_file(index, path)
+      {:ok, loaded} = Index.from_file(path)
 
-        {:ok, %{labels: orig_labels}} = Index.search(index, [1.0, 0.0, 0.0], 3)
-        {:ok, %{labels: loaded_labels}} = Index.search(loaded, [1.0, 0.0, 0.0], 3)
+      {:ok, %{labels: orig_labels}} = Index.search(index, [1.0, 0.0, 0.0], 3)
+      {:ok, %{labels: loaded_labels}} = Index.search(loaded, [1.0, 0.0, 0.0], 3)
 
-        assert orig_labels == loaded_labels
-      after
-        File.rm(path)
-      end
+      assert orig_labels == loaded_labels
     end
 
     test "clone preserves search results independently" do
