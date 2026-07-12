@@ -17,10 +17,49 @@ Binds to FAISS via its official C API (`libfaiss_c`). No external dependencies b
 
 - Erlang/OTP 27+ with NIF support
 - Elixir 1.18+
-- C/C++ compiler (gcc or clang)
-- **Either** a system FAISS installation **or** CMake 3.17+ to build from source
-- On macOS Apple Silicon: `brew install libomp`
-- For GPU support: CUDA toolkit
+- A C/C++ compiler (clang or gcc)
+- **Either** a system FAISS installation **or** CMake 3.17+ to build from source (the default)
+
+There are no precompiled binaries: the first `mix compile` builds FAISS and the
+NIF from source as shared libraries, cached at `~/.cache/faiss_ex/` (~5–15 min,
+once per FAISS version). Install the platform packages below first.
+
+### macOS setup
+
+```bash
+# Compiler (if you don't have Xcode / command line tools yet)
+xcode-select --install
+
+# Build tools + OpenMP
+brew install cmake libomp
+```
+
+- BLAS comes from the built-in Accelerate framework — nothing to install
+- The build looks for libomp at `$HOMEBREW_PREFIX/opt/libomp` (defaults to
+  `/opt/homebrew` on Apple Silicon); set `HOMEBREW_PREFIX` if yours differs
+
+### Linux setup (Debian/Ubuntu)
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake libopenblas-dev
+```
+
+- `libopenblas-dev` provides the BLAS/LAPACK libraries FAISS links against
+- OpenMP (`libgomp`) ships with gcc — nothing extra to install
+- This is the exact recipe this project's CI uses (ubuntu-22.04)
+
+### Linux setup (Fedora/RHEL)
+
+```bash
+sudo dnf install -y gcc gcc-c++ make cmake openblas-devel
+```
+
+### GPU (optional)
+
+- CUDA toolkit **12.x** — FAISS 1.12.0+ dropped CUDA 11 (see the
+  [GPU Support](#gpu-support) section)
+- Build with `USE_CUDA=true mix compile`
 
 ## Installation
 
@@ -105,6 +144,25 @@ rm -rf ~/.cache/faiss_ex && FAISS_OPT_LEVEL=avx2 mix compile
 ```
 
 > **Note:** Apple Silicon (M1-M4) uses NEON which is always enabled — `FAISS_OPT_LEVEL` has no effect on ARM macOS.
+
+### Runtime dependencies (releases & Docker)
+
+The compiled artifact in `priv/` contains the NIF plus **shared** `libfaiss` /
+`libfaiss_c` libraries, which link against system libraries at runtime. If you
+build in one environment and run in another (multi-stage Docker builds, `mix
+release` to a different host), the **runtime** image/host also needs:
+
+- **Linux**: `libopenblas0` and `libgomp1` (plus a matching libc)
+
+  ```dockerfile
+  # in the runtime stage of your Dockerfile
+  RUN apt-get update && apt-get install -y libopenblas0 libgomp1 && rm -rf /var/lib/apt/lists/*
+  ```
+
+- **macOS**: `brew install libomp` (Accelerate is part of the OS)
+
+Build and runtime must use the same OS/architecture — the cached FAISS build is
+not portable across platforms.
 
 ## Usage
 
@@ -382,6 +440,22 @@ On macOS, install libomp:
 ```bash
 brew install libomp
 ```
+
+On Linux, OpenMP ships with gcc; make sure `build-essential` (or `gcc-c++`) is installed.
+
+### `Could NOT find BLAS` / `LAPACK not found` during build (Linux)
+
+FAISS needs a BLAS implementation:
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install -y libopenblas-dev
+
+# Fedora/RHEL
+sudo dnf install -y openblas-devel
+```
+
+macOS never needs this — the Accelerate framework provides BLAS.
 
 ### `Library not loaded: libfaiss_c.dylib`
 
