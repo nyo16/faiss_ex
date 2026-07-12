@@ -4,11 +4,20 @@
 #   FAISS_PREFIX   - path to pre-installed FAISS (skips building from source)
 #   FAISS_GIT_REPO - FAISS git repository URL (ignored when FAISS_PREFIX is set)
 #   FAISS_GIT_REV  - FAISS git revision/tag to build (ignored when FAISS_PREFIX is set)
+#   FAISS_GIT_SHA  - commit FAISS_GIT_REV must resolve to; empty skips verification
 #   USE_CUDA       - "true" to enable GPU support
 #   MIX_APP_PATH   - set by elixir_make
 
 FAISS_GIT_REPO ?= https://github.com/facebookresearch/faiss.git
 FAISS_GIT_REV  ?= v1.14.3
+# Tags are mutable refs — verify the clone resolves to the expected commit.
+# The default SHA only applies to the default rev; a custom FAISS_GIT_REV
+# builds unverified unless FAISS_GIT_SHA is provided alongside it.
+# Keep rev+SHA in sync with mix.exs (make_env/0).
+ifeq ($(FAISS_GIT_REV),v1.14.3)
+FAISS_GIT_SHA ?= 0ca9df4792b173d573044ee14ca0704780176e82
+endif
+FAISS_GIT_SHA ?=
 USE_CUDA       ?= false
 FAISS_OPT_LEVEL ?= generic
 
@@ -133,11 +142,21 @@ else
 
 all: $(NIF_SO)
 
-# Step 1: Clone FAISS
+# Step 1: Clone FAISS and verify the pinned commit
 $(FAISS_SRC)/.cloned:
 	@echo "==> Cloning FAISS $(FAISS_GIT_REV)..."
 	mkdir -p $(CACHE_DIR)
 	git clone --depth 1 --branch $(FAISS_GIT_REV) $(FAISS_GIT_REPO) $(FAISS_SRC)
+	@if [ -n "$(FAISS_GIT_SHA)" ]; then \
+	  actual=$$(git -C $(FAISS_SRC) rev-parse HEAD); \
+	  if [ "$$actual" != "$(FAISS_GIT_SHA)" ]; then \
+	    echo "ERROR: FAISS $(FAISS_GIT_REV) resolved to commit $$actual"; \
+	    echo "       but FAISS_GIT_SHA expects $(FAISS_GIT_SHA)."; \
+	    echo "       The upstream tag may have moved — refusing to build."; \
+	    rm -rf $(FAISS_SRC); \
+	    exit 1; \
+	  fi; \
+	fi
 	touch $@
 
 # Step 2: Configure FAISS

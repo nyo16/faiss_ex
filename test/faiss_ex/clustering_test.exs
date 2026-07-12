@@ -105,5 +105,10 @@ defmodule FaissEx.ClusteringTest do
       assert {:error, "clustering not trained"} =
                Clustering.get_cluster_assignment(clustering, [[1.0, 0.0, 0.0, 0.0]])
     end
+
+    test "get_centroids before train returns error" do
+      {:ok, clustering} = Clustering.new(4, 2)
+      assert {:error, "no centroids available"} = Clustering.get_centroids(clustering)
+    end
   end
 end

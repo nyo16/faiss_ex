@@ -4,6 +4,11 @@ defmodule FaissEx.MixProject do
   @version "0.3.0"
   @source_url "https://github.com/nyo16/faiss_ex"
 
+  # Keep rev+SHA in sync with Makefile. The SHA is what the tag must resolve
+  # to post-clone — tags are mutable refs, the commit is the real pin.
+  @faiss_git_rev "v1.14.3"
+  @faiss_git_sha "0ca9df4792b173d573044ee14ca0704780176e82"
+
   def project do
     [
       app: :faiss_ex,
@@ -64,12 +69,18 @@ defmodule FaissEx.MixProject do
   end
 
   defp make_env do
+    rev = System.get_env("FAISS_GIT_REV", @faiss_git_rev)
+
+    # A custom rev builds unverified unless FAISS_GIT_SHA is provided with it.
+    default_sha = if rev == @faiss_git_rev, do: @faiss_git_sha, else: ""
+
     env = %{
       "USE_CUDA" => System.get_env("USE_CUDA", "false"),
       "FAISS_OPT_LEVEL" => System.get_env("FAISS_OPT_LEVEL", "generic"),
       "FAISS_GIT_REPO" =>
         System.get_env("FAISS_GIT_REPO", "https://github.com/facebookresearch/faiss.git"),
-      "FAISS_GIT_REV" => System.get_env("FAISS_GIT_REV", "v1.14.3")
+      "FAISS_GIT_REV" => rev,
+      "FAISS_GIT_SHA" => System.get_env("FAISS_GIT_SHA", default_sha)
     }
 
     case System.get_env("FAISS_PREFIX") do

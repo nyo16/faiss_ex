@@ -388,6 +388,73 @@ defmodule FaissEx.IndexTest do
     end
   end
 
+  describe "untrained index error paths" do
+    test "add to an untrained IVF index returns error" do
+      {:ok, index} = Index.new(8, "IVF4,Flat")
+      assert {:ok, false} = Index.trained?(index)
+
+      assert {:error, msg} = Index.add(index, List.duplicate(0.5, 8))
+      assert msg =~ "train"
+      assert {:ok, 0} = Index.ntotal(index)
+    end
+
+    test "search on an untrained IVF index returns error" do
+      {:ok, index} = Index.new(8, "IVF4,Flat")
+
+      assert {:error, msg} = Index.search(index, List.duplicate(0.5, 8), 1)
+      assert msg =~ "train"
+    end
+  end
+
+  describe "resource lifecycle" do
+    test "index created in another process survives its owner's death" do
+      parent = self()
+
+      {pid, mref} =
+        spawn_monitor(fn ->
+          {:ok, index} = Index.new(4, "Flat")
+          :ok = Index.add(index, [1.0, 2.0, 3.0, 4.0])
+          send(parent, {:index, index})
+        end)
+
+      assert_receive {:index, index}
+      assert_receive {:DOWN, ^mref, :process, ^pid, :normal}
+
+      # The creating process is gone; the resource must still be alive and
+      # usable from here (refcounted, not owner-bound)
+      assert {:ok, 1} = Index.ntotal(index)
+      assert {:ok, %{labels: [[0]]}} = Index.search(index, [1.0, 2.0, 3.0, 4.0], 1)
+    end
+
+    test "dropping index and clustering resources under churn does not crash the VM" do
+      vectors =
+        List.duplicate([1.0, 0.0, 0.0, 0.0], 50) ++
+          List.duplicate([0.0, 0.0, 0.0, 1.0], 50)
+
+      # Each task's resources become unreachable when it exits, so their NIF
+      # destructors run as the dead heaps are collected
+      for _ <- 1..25 do
+        task =
+          Task.async(fn ->
+            {:ok, index} = Index.new(4, "Flat")
+            :ok = Index.add(index, vectors)
+            {:ok, _} = Index.search(index, hd(vectors), 3)
+
+            {:ok, clustering} = FaissEx.Clustering.new(4, 2)
+            {:ok, _trained} = FaissEx.Clustering.train(clustering, vectors)
+            :ok
+          end)
+
+        assert Task.await(task) == :ok
+      end
+
+      # The NIF must still be fully functional after the churn
+      {:ok, index} = Index.new(4, "Flat")
+      :ok = Index.add(index, [1.0, 0.0, 0.0, 0.0])
+      assert {:ok, 1} = Index.ntotal(index)
+    end
+  end
+
   describe "input validation" do
     test "raises on invalid metric" do
       assert_raise ArgumentError,
