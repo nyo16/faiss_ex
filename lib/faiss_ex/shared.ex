@@ -22,6 +22,39 @@ defmodule FaissEx.Shared do
   end
 
   @doc false
+  @spec encode_ids!([integer()]) :: {non_neg_integer(), binary()}
+  def encode_ids!(ids) when is_list(ids), do: encode_ids(ids, 0, <<>>)
+
+  defp encode_ids([], n, acc), do: {n, acc}
+
+  defp encode_ids([i | rest], n, acc) when is_integer(i) do
+    encode_ids(rest, n + 1, <<acc::binary, i::signed-native-64>>)
+  end
+
+  defp encode_ids([bad | _], n, _acc) do
+    raise ArgumentError, "id #{n} is not an integer: #{inspect(bad)}"
+  end
+
+  @doc false
+  @spec binary_to_float_rows(binary(), pos_integer()) :: [[float()]]
+  def binary_to_float_rows(bin, row_len) when is_binary(bin) do
+    decode_rows(bin, row_len * 4, &binary_to_floats/1, [])
+  end
+
+  @doc false
+  @spec binary_to_int64_rows(binary(), pos_integer()) :: [[integer()]]
+  def binary_to_int64_rows(bin, row_len) when is_binary(bin) do
+    decode_rows(bin, row_len * 8, &binary_to_int64s/1, [])
+  end
+
+  defp decode_rows(<<>>, _row_size, _decode, acc), do: Enum.reverse(acc)
+
+  defp decode_rows(bin, row_size, decode, acc) do
+    <<row::binary-size(^row_size), rest::binary>> = bin
+    decode_rows(rest, row_size, decode, [decode.(row) | acc])
+  end
+
+  @doc false
   @spec encode_vectors!([number()] | [[number()]], pos_integer()) ::
           {non_neg_integer(), binary()}
   def encode_vectors!(data, dim)

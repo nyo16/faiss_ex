@@ -163,7 +163,7 @@ defmodule FaissEx.Index do
   def add_with_ids(%__MODULE__{ref: ref, dim: dim}, data, ids)
       when is_list(data) and is_list(ids) do
     {n, data_bin} = Shared.encode_vectors!(data, dim)
-    ids_bin = Shared.int64s_to_binary(ids)
+    {_n_ids, ids_bin} = Shared.encode_ids!(ids)
 
     case NIF.nif_add_with_ids_to_index(ref, n, data_bin, ids_bin) do
       :ok -> :ok
@@ -186,8 +186,8 @@ defmodule FaissEx.Index do
 
     case NIF.nif_search_index(ref, n, data_bin, k) do
       {:ok, {distances_bin, labels_bin}} ->
-        distances = distances_bin |> Shared.binary_to_floats() |> Enum.chunk_every(k)
-        labels = labels_bin |> Shared.binary_to_int64s() |> Enum.chunk_every(k)
+        distances = Shared.binary_to_float_rows(distances_bin, k)
+        labels = Shared.binary_to_int64_rows(labels_bin, k)
         {:ok, %{distances: distances, labels: labels}}
 
       {:error, _} = err ->
@@ -241,12 +241,11 @@ defmodule FaissEx.Index do
   """
   @spec reconstruct(t(), [integer()]) :: {:ok, [[float()]]} | error()
   def reconstruct(%__MODULE__{ref: ref, dim: dim}, keys) when is_list(keys) do
-    n = length(keys)
-    keys_bin = Shared.int64s_to_binary(keys)
+    {n, keys_bin} = Shared.encode_ids!(keys)
 
     case NIF.nif_reconstruct_batch(ref, n, keys_bin) do
       {:ok, result_bin} ->
-        {:ok, result_bin |> Shared.binary_to_floats() |> Enum.chunk_every(dim)}
+        {:ok, Shared.binary_to_float_rows(result_bin, dim)}
 
       {:error, _} = err ->
         err
@@ -266,7 +265,7 @@ defmodule FaissEx.Index do
 
     case NIF.nif_compute_residuals(ref, n, data_bin, keys_bin) do
       {:ok, result_bin} ->
-        {:ok, result_bin |> Shared.binary_to_floats() |> Enum.chunk_every(dim)}
+        {:ok, Shared.binary_to_float_rows(result_bin, dim)}
 
       {:error, _} = err ->
         err
