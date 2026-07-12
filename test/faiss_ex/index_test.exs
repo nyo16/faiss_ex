@@ -464,6 +464,130 @@ defmodule FaissEx.IndexTest do
     end
   end
 
+  describe "binary API" do
+    alias FaissEx.Shared
+
+    defp encode(rows), do: rows |> List.flatten() |> Shared.floats_to_binary()
+
+    test "add with a binary matches add with lists" do
+      vectors = for i <- 0..9, do: for(j <- 1..4, do: i * 10.0 + j)
+
+      {:ok, list_index} = Index.new(4, "Flat")
+      {:ok, bin_index} = Index.new(4, "Flat")
+
+      :ok = Index.add(list_index, vectors)
+      :ok = Index.add(bin_index, encode(vectors))
+
+      assert {:ok, 10} = Index.ntotal(bin_index)
+
+      query = hd(vectors)
+      {:ok, list_results} = Index.search(list_index, query, 3)
+      {:ok, bin_results} = Index.search(bin_index, query, 3)
+      assert list_results == bin_results
+    end
+
+    test "train with a binary matches train with lists" do
+      data = for _ <- 1..200, do: for(_ <- 1..8, do: :rand.uniform())
+
+      {:ok, index} = Index.new(8, "IVF4,Flat")
+      assert :ok = Index.train(index, encode(data))
+      assert {:ok, true} = Index.trained?(index)
+
+      :ok = Index.add(index, encode(data))
+      assert {:ok, 200} = Index.ntotal(index)
+    end
+
+    test "search_binary returns raw binaries matching search/3" do
+      vectors = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+      {:ok, index} = Index.new(3, "Flat")
+      :ok = Index.add(index, vectors)
+
+      queries = [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+      {:ok, list_results} = Index.search(index, queries, 2)
+
+      {:ok, %{n: 2, distances: dist_bin, labels: labels_bin}} =
+        Index.search_binary(index, encode(queries), 2)
+
+      assert Shared.binary_to_float_rows(dist_bin, 2) == list_results.distances
+      assert Shared.binary_to_int64_rows(labels_bin, 2) == list_results.labels
+    end
+
+    test "reconstruct_binary matches reconstruct/2 for list and binary keys" do
+      vectors = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+
+      {:ok, index} = Index.new(3, "Flat")
+      :ok = Index.add(index, vectors)
+
+      {:ok, from_lists} = Index.reconstruct(index, [0, 1])
+
+      {:ok, bin_from_list_keys} = Index.reconstruct_binary(index, [0, 1])
+      {:ok, bin_from_bin_keys} = Index.reconstruct_binary(index, Shared.int64s_to_binary([0, 1]))
+
+      assert bin_from_list_keys == bin_from_bin_keys
+      assert Shared.binary_to_float_rows(bin_from_list_keys, 3) == from_lists
+    end
+
+    test "add_with_ids accepts mixed list/binary forms" do
+      vectors = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+      ids = [100, 200]
+      vectors_bin = encode(vectors)
+      ids_bin = Shared.int64s_to_binary(ids)
+
+      combos = [
+        {vectors, ids_bin},
+        {vectors_bin, ids},
+        {vectors_bin, ids_bin}
+      ]
+
+      for {data, id_arg} <- combos do
+        {:ok, index} = Index.new(4, "IDMap,Flat")
+        assert :ok = Index.add_with_ids(index, data, id_arg)
+        assert {:ok, 2} = Index.ntotal(index)
+        assert {:ok, %{labels: [[100]]}} = Index.search(index, hd(vectors), 1)
+      end
+    end
+
+    test "raises on a binary not divisible by dim * 4 with actual sizes" do
+      {:ok, index} = Index.new(4, "Flat")
+
+      assert_raise ArgumentError,
+                   "binary has 13 bytes, expected a multiple of 16 (dim 4 * 4 bytes per f32)",
+                   fn -> Index.add(index, <<0::size(13 * 8)>>) end
+    end
+
+    test "raises on an ids binary not divisible by 8" do
+      {:ok, index} = Index.new(4, "IDMap,Flat")
+      vectors_bin = encode([[1.0, 0.0, 0.0, 0.0]])
+
+      assert_raise ArgumentError,
+                   "ids binary has 3 bytes, expected a multiple of 8 (one s64 per id)",
+                   fn -> Index.add_with_ids(index, vectors_bin, <<1, 2, 3>>) end
+    end
+
+    test "adding an empty binary is a no-op" do
+      {:ok, index} = Index.new(4, "Flat")
+      assert :ok = Index.add(index, <<>>)
+      assert {:ok, 0} = Index.ntotal(index)
+    end
+
+    test "add_with_ids with mismatched binary sizes returns error" do
+      {:ok, index} = Index.new(4, "IDMap,Flat")
+      vectors_bin = encode([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+
+      assert {:error, "binary size mismatch"} =
+               Index.add_with_ids(index, vectors_bin, <<100::signed-native-64>>)
+    end
+
+    test "search_binary on an empty query binary returns empty results" do
+      {:ok, index} = Index.new(4, "Flat")
+      :ok = Index.add(index, [[1.0, 0.0, 0.0, 0.0]])
+
+      assert {:ok, %{n: 0, distances: <<>>, labels: <<>>}} =
+               Index.search_binary(index, <<>>, 2)
+    end
+  end
+
   describe "num_gpus" do
     test "FaissEx.num_gpus/0 returns a non-negative integer" do
       count = FaissEx.num_gpus()

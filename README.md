@@ -9,6 +9,7 @@ Binds to FAISS via its official C API (`libfaiss_c`). No external dependencies b
 - Vector similarity search (L2, inner product)
 - Index factory support (`"Flat"`, `"IVF4,Flat"`, `"HNSW32"`, etc.)
 - Add, search, train, clone, reset, reconstruct
+- Binary fast path — pass raw f32 binaries straight through, no list encoding
 - File I/O (save/load indexes)
 - K-means clustering
 - GPU support (CUDA)
@@ -68,7 +69,7 @@ Add `faiss_ex` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:faiss_ex, "~> 0.1.0"}
+    {:faiss_ex, "~> 0.3.0"}
   ]
 end
 ```
@@ -174,6 +175,8 @@ FaissEx.Index.add(index, [1.0, 2.0, 3.0])
 # Batch of vectors
 FaissEx.Index.add(index, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
 ```
+
+Hot paths also accept **raw binaries** directly — see [Binary API](#binary-api-zero-copy-hot-path).
 
 ### Creating an index and searching
 
@@ -288,6 +291,38 @@ Search with multiple query vectors at once for better throughput:
 {:ok, %{distances: distances, labels: labels}} = FaissEx.Index.search(index, batch_of_queries, 10)
 # distances: [[float]] — 100 rows of 10 distances
 # labels: [[integer]] — 100 rows of 10 vector IDs
+```
+
+## Binary API (zero-copy hot path)
+
+Encoding lists to the flat f32 layout FAISS expects dominates the cost of
+batch operations — adding 10,000×128 vectors as lists spends ~14 ms encoding
+(plus GC) around a ~0.4 ms FAISS call. When your vectors already arrive as
+binaries (an HTTP response, a database blob, a file), pass them straight
+through and skip all of it:
+
+```elixir
+# Embeddings API responses are already packed floats — decode base64, done.
+# Layout contract: f32-native, row-major, dim floats per vector.
+embeddings_bin = Base.decode64!(response.body["embedding_b64"])
+
+{:ok, index} = FaissEx.Index.new(1536, "Flat")
+:ok = FaissEx.Index.add(index, embeddings_bin)   # n inferred from byte_size
+```
+
+`add/2`, `train/2`, and `add_with_ids/3` accept binaries anywhere they accept
+lists (IDs/keys are `s64-native`; mixing forms is fine). For zero-decode
+results, opt in with the `_binary` variants — the list-returning functions
+never change shape based on input type:
+
+```elixir
+{:ok, %{n: n, distances: dist_bin, labels: labels_bin}} =
+  FaissEx.Index.search_binary(index, queries_bin, 10)
+
+{:ok, vectors_bin} = FaissEx.Index.reconstruct_binary(index, ids_bin)
+
+# Decode when needed
+labels = for <<i::signed-native-64 <- labels_bin>>, do: i
 ```
 
 ## Example: Semantic Search with External Embeddings
@@ -429,7 +464,7 @@ Elixir (FaissEx.Index) → NIF stubs (FaissEx.NIF) → C (faiss_ex_nif.c) → li
 - **Single C file**: All NIF code lives in `c_src/faiss_ex_nif.c`
 - **NIF resources**: FAISS index pointers are wrapped in NIF resource types with destructors, so BEAM GC handles cleanup
 - **No processes**: FaissEx uses plain functions and data — no GenServers or supervision trees
-- **No dependencies**: Vectors flow in/out as plain lists; binary conversion happens internally
+- **No dependencies**: Vectors flow in/out as plain lists (with binary conversion handled internally) or as raw f32 binaries via the [Binary API](#binary-api-zero-copy-hot-path)
 
 ## Troubleshooting
 
@@ -548,26 +583,31 @@ Index: 10,000 vectors, 128 dimensions, Flat L2.
 
 | Operation | ips | avg | median | 99th % |
 |-----------|-----|-----|--------|--------|
-| reconstruct 1 vector | 141.05 K | 7.09 μs | 6.96 μs | 13.79 μs |
-| add 1 vector | 83.64 K | 11.96 μs | 10.50 μs | 31.17 μs |
-| compute_residuals 1 vector | 17.48 K | 57.21 μs | 54.50 μs | 117.78 μs |
-| reconstruct 10 vectors | 16.68 K | 59.96 μs | 57.75 μs | 118.00 μs |
-| search k=10, 1 query | 8.48 K | 117.94 μs | 114.13 μs | 263.71 μs |
-| compute_residuals 10 vectors | 7.36 K | 135.85 μs | 128.17 μs | 247.56 μs |
-| kmeans assign 100 vectors | 3.87 K | 258.16 μs | 249.75 μs | 494.97 μs |
-| search k=10, 10 queries | 2.97 K | 337.12 μs | 335.83 μs | 381.58 μs |
-| reconstruct 100 vectors | 1.10 K | 911.66 μs | 847.73 μs | 1786.82 μs |
-| compute_residuals 100 vectors | 1.09 K | 914.24 μs | 881.77 μs | 1223.25 μs |
-| search k=10, 100 queries | 0.45 K | 2.20 ms | 2.18 ms | 2.47 ms |
-| kmeans k=50, 1000 vectors | 0.26 K | 3.87 ms | 3.63 ms | 4.70 ms |
-| kmeans k=10, 1000 vectors | 0.22 K | 4.50 ms | 4.09 ms | 5.83 ms |
-| add 1000 vectors | 0.090 K | 11.08 ms | 11.62 ms | 21.81 ms |
-| add 10000 vectors | 0.069 K | 14.45 ms | 13.39 ms | 36.66 ms |
+| reconstruct 1 vector | 268.99 K | 3.72 μs | 3.50 μs | 8.83 μs |
+| add 1 vector | 92.00 K | 10.87 μs | 10.42 μs | 15.83 μs |
+| reconstruct 10 vectors | 38.68 K | 25.85 μs | 23.83 μs | 40.67 μs |
+| compute_residuals 1 vector | 18.02 K | 55.48 μs | 52.54 μs | 119.36 μs |
+| compute_residuals 10 vectors | 9.80 K | 102.08 μs | 99.71 μs | 184.31 μs |
+| search k=10, 1 query | 8.98 K | 111.33 μs | 109.67 μs | 140.55 μs |
+| reconstruct 100 vectors | 3.78 K | 264.60 μs | 257.75 μs | 416.53 μs |
+| kmeans assign 100 vectors | 3.72 K | 268.60 μs | 258.67 μs | 482.14 μs |
+| search k=10, 10 queries | 3.07 K | 325.63 μs | 322.13 μs | 385.24 μs |
+| **add 10000 vectors (binary)** | 2.84 K | 352.32 μs | 407.63 μs | 530.05 μs |
+| compute_residuals 100 vectors | 1.75 K | 570.45 μs | 563.38 μs | 774.81 μs |
+| **search k=10, 100 queries (binary)** | 0.50 K | 1.99 ms | 1.95 ms | 2.24 ms |
+| search k=10, 100 queries | 0.47 K | 2.14 ms | 2.12 ms | 2.43 ms |
+| kmeans k=50, 1000 vectors | 0.25 K | 3.96 ms | 4.31 ms | 4.93 ms |
+| kmeans k=10, 1000 vectors | 0.25 K | 4.06 ms | 3.93 ms | 4.92 ms |
+| add 1000 vectors | 0.090 K | 11.03 ms | 11.28 ms | 21.59 ms |
+| add 10000 vectors | 0.069 K | 14.41 ms | 13.41 ms | 36.50 ms |
 
-> **Note:** the batch `add` scenarios are dominated by list→binary encoding
-> and BEAM garbage collection of the benchmark corpus, not by FAISS — the
-> NIF-side add of 10,000 vectors is ~0.4 ms. This is also why `add 1000`
-> and `add 10000` land so close together.
+> **Note:** the list-input batch `add` scenarios are dominated by
+> list→binary encoding and BEAM garbage collection of the benchmark
+> corpus, not by FAISS — which is why `add 1000` and `add 10000` land so
+> close together. The `(binary)` rows are the same operations through the
+> [Binary API](#binary-api-zero-copy-hot-path): adding 10,000 vectors
+> drops from ~14.4 ms to ~0.35 ms (41×) and allocates ~0.2 KB instead of
+> ~938 KB on the BEAM side.
 
 Run benchmarks yourself:
 

@@ -1,5 +1,6 @@
 alias FaissEx.Index
 alias FaissEx.Clustering
+alias FaissEx.Shared
 
 dim = 128
 num_vectors = 10_000
@@ -11,6 +12,10 @@ vectors = for _ <- 1..num_vectors, do: for(_ <- 1..dim, do: :rand.uniform())
 query_1 = [for(_ <- 1..dim, do: :rand.uniform())]
 query_10 = for _ <- 1..10, do: for(_ <- 1..dim, do: :rand.uniform())
 query_100 = for _ <- 1..100, do: for(_ <- 1..dim, do: :rand.uniform())
+
+# Pre-encoded binaries for the binary fast-path scenarios
+{^num_vectors, vectors_bin} = Shared.encode_vectors!(vectors, dim)
+{100, query_100_bin} = Shared.encode_vectors!(query_100, dim)
 
 # Build a populated Flat index for search/reconstruct/residual benchmarks
 {:ok, flat_index} = Index.new(dim, "Flat")
@@ -51,6 +56,10 @@ Benchee.run(
       {:ok, idx} = Index.new(dim, "Flat")
       :ok = Index.add(idx, vectors)
     end,
+    "add 10000 vectors (binary)" => fn ->
+      {:ok, idx} = Index.new(dim, "Flat")
+      :ok = Index.add(idx, vectors_bin)
+    end,
 
     # --- Search ---
     "search k=#{k}, 1 query" => fn ->
@@ -61,6 +70,9 @@ Benchee.run(
     end,
     "search k=#{k}, 100 queries" => fn ->
       {:ok, _} = Index.search(flat_index, query_100, k)
+    end,
+    "search k=#{k}, 100 queries (binary)" => fn ->
+      {:ok, _} = Index.search_binary(flat_index, query_100_bin, k)
     end,
 
     # --- Reconstruct ---

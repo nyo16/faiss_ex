@@ -92,7 +92,7 @@ defmodule FaissEx.Clustering do
   def get_centroids(%__MODULE__{ref: ref, d: d}) do
     case NIF.nif_get_clustering_centroids(ref) do
       {:ok, {_k, _d, centroids_bin}} ->
-        {:ok, centroids_bin |> Shared.binary_to_floats() |> Enum.chunk_every(d)}
+        {:ok, Shared.binary_to_float_rows(centroids_bin, d)}
 
       {:error, _} = err ->
         err
