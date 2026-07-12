@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Elixir NIF bindings for FAISS (Facebook AI Similarity Search) via the C API (`libfaiss_c`). No external dependencies beyond `elixir_make`. Supports vector similarity search (L2, inner product), index factory, k-means clustering, and optional CUDA GPU support.
+Elixir NIF bindings for FAISS (Facebook AI Similarity Search) via the C API (`libfaiss_c`). No external dependencies beyond `elixir_make`. Supports vector similarity search (L2, inner product), index factory, k-means clustering, and optional CUDA GPU support (CUDA 12.x required). FAISS is pinned at v1.14.3 via `FAISS_GIT_REV` — defined in BOTH `Makefile` and `mix.exs` (`make_env/0`); keep them in sync.
 
 ## Build & Test Commands
 
@@ -38,19 +38,22 @@ Elixir (FaissEx.Index / FaissEx.Clustering)
 
 **Key modules:**
 - `lib/faiss_ex/index.ex` — Index struct and all index operations (new, add, search, train, clone, reset, reconstruct, file I/O, GPU transfer). Accepts flat lists (single vector) or lists of lists (batch).
-- `lib/faiss_ex/clustering.ex` — K-means clustering (new, train, get_centroids, get_cluster_assignment). Creates a temporary Flat index as quantizer during training.
+- `lib/faiss_ex/clustering.ex` — K-means clustering (new, train, get_centroids, get_cluster_assignment). Training creates a Flat quantizer index that FAISS populates with the centroids; `get_cluster_assignment/2` searches that same quantizer (do not rebuild it).
 - `lib/faiss_ex/nif.ex` — Raw NIF function stubs. All functions prefixed `nif_`. Returns `{:ok, result}`, `:ok`, or `{:error, binary_message}`.
-- `lib/faiss_ex/shared.ex` — Binary conversion helpers (`floats_to_binary`, `binary_to_floats`, `int64s_to_binary`, `binary_to_int64s`) and `unwrap!/1`.
+- `lib/faiss_ex/shared.ex` — `encode_vectors!/2` (single-pass list→f32 binary with per-row dim validation, raises ArgumentError) plus decode helpers (`binary_to_floats`, `int64s_to_binary`, `binary_to_int64s`).
 - `c_src/faiss_ex_nif.c` — Single C file with all NIF implementations. Uses NIF resource types with destructors for index/clustering/GPU resource lifecycle.
 
 **NIF resource types:** `FaissIndex`, `FaissClustering`, `FaissGpuResources` (when `FAISS_GPU_ENABLED`). BEAM GC handles cleanup via destructors.
 
-**Dirty schedulers:** add, add_with_ids, search, train → `DIRTY_JOB_CPU_BOUND`; write/read index, GPU transfer → `DIRTY_JOB_IO_BOUND`.
+**Locking convention (C layer):** every index/clustering resource carries an `ErlNifRWLock`. Mutations (add/add_with_ids/train/reset/train_clustering) take the write lock; reads (search/reconstruct/residuals/write_index/clone/GPU transfer/centroids/getters) take the read lock. `nif_train_clustering` locks two resources — fixed order: quantizer index first, then clustering. Any NIF that can block on a lock must run on a dirty scheduler.
 
-**Data flow:** Elixir converts lists to f32/s64 binaries via `Shared` helpers → passed to NIF → NIF returns raw binaries → Elixir decodes back to lists.
+**Dirty schedulers:** add, add_with_ids, search, train, reset, reconstruct, residuals, clone, centroids, and the dim/ntotal/is_trained getters → `DIRTY_JOB_CPU_BOUND`; write/read index, GPU transfer → `DIRTY_JOB_IO_BOUND`. Only `nif_new_index`, `nif_new_clustering`, and `nif_get_num_gpus` stay on normal schedulers.
+
+**Data flow:** Elixir encodes lists to f32/s64 binaries via `Shared` → passed to NIF → NIF returns raw binaries → Elixir decodes back to lists.
 
 ## Test Tags
 
 - `@tag :cuda` — GPU tests, excluded unless `USE_CUDA=true`
-- `@tag :slow` — always excluded by default
+- `@tag :no_cuda` — asserts non-CUDA-build error paths, excluded when `USE_CUDA=true`
+- `@tag :slow` — always excluded by default (`mix test --include slow` to run)
 - `@tag :cuda` goes before individual `test`, NOT before `describe`; use `@describetag` inside a `describe` block

@@ -35,6 +35,22 @@ defmodule FaissEx.Index do
 
       {:ok, gpu_index} = FaissEx.Index.cpu_to_gpu(index, 0)
       {:ok, cpu_index} = FaissEx.Index.gpu_to_cpu(gpu_index)
+
+  ## Concurrency
+
+  An index can be shared freely across processes. The NIF layer guards
+  every index with a read-write lock:
+
+    * Mutations — `add/2`, `add_with_ids/3`, `train/2`, `reset/1` — take
+      the write lock and serialize against all other operations on the
+      same index.
+    * Read-only operations — `search/3`, `reconstruct/2`,
+      `compute_residuals/3`, `to_file/2`, `clone/1` and the property
+      getters — take the read lock, so concurrent searches still run in
+      parallel.
+
+  Heavy operations run on dirty schedulers and never block the BEAM's
+  normal schedulers, even while waiting on the lock.
   """
 
   alias FaissEx.NIF

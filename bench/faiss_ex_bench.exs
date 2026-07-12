@@ -28,6 +28,11 @@ data_100 = Enum.take(vectors, 100)
 # Clustering data (smaller for reasonable bench times)
 cluster_data = for _ <- 1..1000, do: for(_ <- 1..dim, do: :rand.uniform())
 
+# Pre-trained clustering for assignment benchmarks
+{:ok, assign_clustering} = Clustering.new(dim, 10)
+{:ok, assign_trained} = Clustering.train(assign_clustering, cluster_data)
+assign_data_100 = Enum.take(cluster_data, 100)
+
 Benchee.run(
   %{
     # --- Add ---
@@ -88,6 +93,9 @@ Benchee.run(
     "kmeans k=50, 1000 vectors" => fn ->
       {:ok, c} = Clustering.new(dim, 50)
       {:ok, _} = Clustering.train(c, cluster_data)
+    end,
+    "kmeans assign 100 vectors" => fn ->
+      {:ok, _} = Clustering.get_cluster_assignment(assign_trained, assign_data_100)
     end
   },
   warmup: 2,
