@@ -88,6 +88,17 @@ defmodule FaissEx.ClusteringTest do
   end
 
   describe "edge cases" do
+    test "train with fewer points than clusters returns error and stays untrained" do
+      {:ok, clustering} = Clustering.new(4, 10)
+      data = for i <- 1..5, do: [i / 1, 0.0, 0.0, 0.0]
+
+      assert {:error, msg} = Clustering.train(clustering, data)
+      assert is_binary(msg)
+
+      assert {:error, "clustering not trained"} =
+               Clustering.get_cluster_assignment(clustering, [[1.0, 0.0, 0.0, 0.0]])
+    end
+
     test "untrained clustering returns error for assignment" do
       {:ok, clustering} = Clustering.new(4, 2)
 

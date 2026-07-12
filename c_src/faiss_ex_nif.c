@@ -119,6 +119,10 @@ static ERL_NIF_TERM make_error_msg(ErlNifEnv *env, const char *msg) {
 }
 
 static ERL_NIF_TERM make_faiss_error(ErlNifEnv *env, const char *fallback) {
+    /* Relies on faiss_get_last_error() being thread-local (verified for
+     * v1.14.3: c_api/error_impl.cpp) so concurrent NIF calls on different
+     * dirty-scheduler threads cannot cross-contaminate error messages.
+     * Re-verify when bumping FAISS_GIT_REV. */
     const char *err = faiss_get_last_error();
     if (err && strlen(err) > 0) {
         return make_error_msg(env, err);
@@ -239,7 +243,10 @@ static ERL_NIF_TERM nif_add_to_index(ErlNifEnv *env, int argc, const ERL_NIF_TER
     }
 
     if (n < 0) return make_error_msg(env, "n must be non-negative");
-    if (n == 0) return make_ok_atom(env);
+    if (n == 0) {
+        if (data_bin.size != 0) return make_error_msg(env, "data binary size mismatch");
+        return make_ok_atom(env);
+    }
 
     enif_rwlock_rwlock(res->lock);
 
@@ -278,7 +285,12 @@ static ERL_NIF_TERM nif_add_with_ids_to_index(ErlNifEnv *env, int argc, const ER
     }
 
     if (n < 0) return make_error_msg(env, "n must be non-negative");
-    if (n == 0) return make_ok_atom(env);
+    if (n == 0) {
+        if (data_bin.size != 0 || ids_bin.size != 0) {
+            return make_error_msg(env, "binary size mismatch");
+        }
+        return make_ok_atom(env);
+    }
 
     enif_rwlock_rwlock(res->lock);
 
@@ -396,7 +408,10 @@ static ERL_NIF_TERM nif_train_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     }
 
     if (n < 0) return make_error_msg(env, "n must be non-negative");
-    if (n == 0) return make_ok_atom(env);
+    if (n == 0) {
+        if (data_bin.size != 0) return make_error_msg(env, "data binary size mismatch");
+        return make_ok_atom(env);
+    }
 
     enif_rwlock_rwlock(res->lock);
 
@@ -470,10 +485,12 @@ static ERL_NIF_TERM nif_reconstruct_batch(ErlNifEnv *env, int argc, const ERL_NI
     const idx_t *keys = (const idx_t *)keys_bin.data;
 
     /* Contiguous ascending keys (the common case) can use the batched
-     * faiss_Index_reconstruct_n instead of one call per key. */
+     * faiss_Index_reconstruct_n instead of one call per key. Unsigned
+     * arithmetic: keys are caller-controlled and keys[i-1] + 1 would be
+     * signed-overflow UB at INT64_MAX. */
     int contiguous = 1;
     for (ErlNifSInt64 i = 1; i < n; i++) {
-        if (keys[i] != keys[i - 1] + 1) {
+        if ((uint64_t)keys[i] != (uint64_t)keys[i - 1] + 1u) {
             contiguous = 0;
             break;
         }

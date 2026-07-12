@@ -142,6 +142,26 @@ defmodule FaissEx.IndexTest do
         assert_in_delta expected, actual, 1.0e-6
       end)
     end
+
+    test "reconstructs vectors with non-contiguous keys (per-key fallback)" do
+      {:ok, index} = Index.new(4, "Flat")
+
+      vectors = [
+        [1.0, 2.0, 3.0, 4.0],
+        [5.0, 6.0, 7.0, 8.0],
+        [9.0, 10.0, 11.0, 12.0]
+      ]
+
+      :ok = Index.add(index, vectors)
+
+      # gapped and descending keys must not take the reconstruct_n fast path
+      {:ok, [row2, row0]} = Index.reconstruct(index, [2, 0])
+
+      Enum.zip(Enum.at(vectors, 2) ++ Enum.at(vectors, 0), row2 ++ row0)
+      |> Enum.each(fn {expected, actual} ->
+        assert_in_delta expected, actual, 1.0e-6
+      end)
+    end
   end
 
   describe "to_file/2 and from_file/1" do
@@ -389,6 +409,39 @@ defmodule FaissEx.IndexTest do
       assert_raise ArgumentError, "row 0 has 2 elements, expected 3", fn ->
         Index.add(index, [1.0, 2.0])
       end
+    end
+
+    test "raises on non-number element with row index" do
+      {:ok, index} = Index.new(3, "Flat")
+
+      assert_raise ArgumentError, ~s(row 0 contains a non-number: "x"), fn ->
+        Index.add(index, [[1.0, "x", 3.0]])
+      end
+    end
+
+    test "raises on non-list row in a batch" do
+      {:ok, index} = Index.new(3, "Flat")
+
+      assert_raise ArgumentError, ~s(row 1 is not a list of numbers: "bad"), fn ->
+        Index.add(index, [[1.0, 2.0, 3.0], "bad"])
+      end
+    end
+
+    test "adding an empty batch is a no-op" do
+      {:ok, index} = Index.new(4, "Flat")
+      assert :ok = Index.add(index, [])
+      assert {:ok, 0} = Index.ntotal(index)
+    end
+
+    test "add_with_ids with mismatched id count returns error" do
+      {:ok, index} = Index.new(4, "IDMap,Flat")
+
+      assert {:error, "binary size mismatch"} =
+               Index.add_with_ids(
+                 index,
+                 [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+                 [100]
+               )
     end
 
     test "rejects non-positive dimension" do

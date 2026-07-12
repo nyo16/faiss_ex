@@ -77,6 +77,8 @@ defmodule FaissEx.Clustering do
   def train(%__MODULE__{ref: ref, d: d} = clustering, data) when is_list(data) do
     {n, data_bin} = Shared.encode_vectors!(data, d)
 
+    # On training failure the discarded quantizer is not leaked — its NIF
+    # resource is freed by the BEAM GC via the resource destructor.
     with {:ok, quantizer} <- Index.new(d, "Flat"),
          :ok <- NIF.nif_train_clustering(ref, n, data_bin, quantizer.ref) do
       {:ok, %__MODULE__{clustering | index: quantizer, trained?: true}}
