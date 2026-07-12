@@ -136,6 +136,9 @@ defmodule FaissEx.Index do
     metric = Keyword.get(opts, :metric, :l2)
     device = Keyword.get(opts, :device, :host)
 
+    # Values mirror FaissMetricType in FAISS's c_api/Index_c.h; the C side
+    # static-asserts them, so a FAISS bump that renumbers the enum fails to
+    # compile instead of silently searching the wrong metric.
     metric_int =
       case metric do
         :l2 ->
@@ -184,11 +187,7 @@ defmodule FaissEx.Index do
   @spec add(t(), vector_data()) :: :ok | error()
   def add(%__MODULE__{ref: ref, dim: dim}, data) when is_list(data) or is_binary(data) do
     {n, bin} = encode_vector_data!(data, dim)
-
-    case NIF.nif_add_to_index(ref, n, bin) do
-      :ok -> :ok
-      {:error, _} = err -> err
-    end
+    NIF.nif_add_to_index(ref, n, bin)
   end
 
   @doc """
@@ -209,11 +208,7 @@ defmodule FaissEx.Index do
       when (is_list(data) or is_binary(data)) and (is_list(ids) or is_binary(ids)) do
     {n, data_bin} = encode_vector_data!(data, dim)
     {_n_ids, ids_bin} = encode_id_data!(ids)
-
-    case NIF.nif_add_with_ids_to_index(ref, n, data_bin, ids_bin) do
-      :ok -> :ok
-      {:error, _} = err -> err
-    end
+    NIF.nif_add_with_ids_to_index(ref, n, data_bin, ids_bin)
   end
 
   @doc """
@@ -273,11 +268,7 @@ defmodule FaissEx.Index do
   @spec train(t(), vector_data()) :: :ok | error()
   def train(%__MODULE__{ref: ref, dim: dim}, data) when is_list(data) or is_binary(data) do
     {n, bin} = encode_vector_data!(data, dim)
-
-    case NIF.nif_train_index(ref, n, bin) do
-      :ok -> :ok
-      {:error, _} = err -> err
-    end
+    NIF.nif_train_index(ref, n, bin)
   end
 
   @doc """
@@ -299,10 +290,7 @@ defmodule FaissEx.Index do
   """
   @spec reset(t()) :: :ok | error()
   def reset(%__MODULE__{ref: ref}) do
-    case NIF.nif_reset_index(ref) do
-      :ok -> :ok
-      {:error, _} = err -> err
-    end
+    NIF.nif_reset_index(ref)
   end
 
   @doc """
@@ -336,11 +324,7 @@ defmodule FaissEx.Index do
   def reconstruct_binary(%__MODULE__{ref: ref}, keys)
       when is_list(keys) or is_binary(keys) do
     {n, keys_bin} = encode_id_data!(keys)
-
-    case NIF.nif_reconstruct_batch(ref, n, keys_bin) do
-      {:ok, result_bin} -> {:ok, result_bin}
-      {:error, _} = err -> err
-    end
+    NIF.nif_reconstruct_batch(ref, n, keys_bin)
   end
 
   @doc """
@@ -368,10 +352,7 @@ defmodule FaissEx.Index do
   """
   @spec to_file(t(), String.t()) :: :ok | error()
   def to_file(%__MODULE__{ref: ref}, path) do
-    case NIF.nif_write_index(ref, to_binary(path)) do
-      :ok -> :ok
-      {:error, _} = err -> err
-    end
+    NIF.nif_write_index(ref, to_binary(path))
   end
 
   @doc """
@@ -420,10 +401,7 @@ defmodule FaissEx.Index do
   @doc "Returns whether the index is trained."
   @spec trained?(t()) :: {:ok, boolean()} | error()
   def trained?(%__MODULE__{ref: ref}) do
-    case NIF.nif_get_index_is_trained(ref) do
-      {:ok, val} -> {:ok, val}
-      {:error, _} = err -> err
-    end
+    NIF.nif_get_index_is_trained(ref)
   end
 
   @doc """

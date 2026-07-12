@@ -16,6 +16,12 @@
 #include "c_api/gpu/GpuAutoTune_c.h"
 #endif
 
+/* FaissEx.Index passes metric as a bare integer; these pin the values it
+ * hardcodes to FaissMetricType so a FAISS bump that renumbers the enum
+ * fails to compile instead of silently searching the wrong metric. */
+_Static_assert(METRIC_INNER_PRODUCT == 0, "FaissMetricType renumbered: update FaissEx.Index");
+_Static_assert(METRIC_L2 == 1, "FaissMetricType renumbered: update FaissEx.Index");
+
 /* ========== Resource Types ==========
  *
  * Locking convention: FAISS objects are not thread-safe when a mutation
