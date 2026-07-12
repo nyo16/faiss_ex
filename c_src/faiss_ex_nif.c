@@ -44,7 +44,8 @@ typedef struct {
     ErlNifRWLock *lock;
     /* Cached at wrap time. FAISS sets Index::d at construction and nothing
      * reachable through this NIF mutates it (prepend_transform/addIndex are
-     * not exposed), so reads need no lock. */
+     * not exposed), so reads need no lock. Re-verify when bumping
+     * FAISS_GIT_REV. */
     int dim;
 } IndexResource;
 
