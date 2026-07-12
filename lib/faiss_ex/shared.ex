@@ -37,13 +37,15 @@ defmodule FaissEx.Shared do
 
   @doc false
   @spec binary_to_float_rows(binary(), pos_integer()) :: [[float()]]
-  def binary_to_float_rows(bin, row_len) when is_binary(bin) do
+  def binary_to_float_rows(bin, row_len)
+      when is_binary(bin) and is_integer(row_len) and row_len > 0 do
     decode_rows(bin, row_len * 4, &binary_to_floats/1, [])
   end
 
   @doc false
   @spec binary_to_int64_rows(binary(), pos_integer()) :: [[integer()]]
-  def binary_to_int64_rows(bin, row_len) when is_binary(bin) do
+  def binary_to_int64_rows(bin, row_len)
+      when is_binary(bin) and is_integer(row_len) and row_len > 0 do
     decode_rows(bin, row_len * 8, &binary_to_int64s/1, [])
   end
 
