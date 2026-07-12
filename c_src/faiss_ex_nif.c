@@ -42,6 +42,10 @@ static ErlNifResourceType *GPU_RESOURCES_RESOURCE_TYPE;
 typedef struct {
     FaissIndex *index;
     ErlNifRWLock *lock;
+    /* Cached at wrap time. FAISS sets Index::d at construction and nothing
+     * reachable through this NIF mutates it (prepend_transform/addIndex are
+     * not exposed), so reads need no lock. */
+    int dim;
 } IndexResource;
 
 typedef struct {
@@ -160,6 +164,7 @@ static int wrap_index_resource(ErlNifEnv *env, FaissIndex *index, ERL_NIF_TERM *
     }
     res->index = index;
     res->lock = lock;
+    res->dim = faiss_Index_d(index);
     *ref_out = enif_make_resource(env, res);
     enif_release_resource(res);
     return 1;
@@ -250,7 +255,7 @@ static ERL_NIF_TERM nif_add_to_index(ErlNifEnv *env, int argc, const ERL_NIF_TER
 
     enif_rwlock_rwlock(res->lock);
 
-    int dim = faiss_Index_d(res->index);
+    int dim = res->dim;
     size_t nd, expected;
     if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &expected)) {
         enif_rwlock_rwunlock(res->lock);
@@ -294,7 +299,7 @@ static ERL_NIF_TERM nif_add_with_ids_to_index(ErlNifEnv *env, int argc, const ER
 
     enif_rwlock_rwlock(res->lock);
 
-    int dim = faiss_Index_d(res->index);
+    int dim = res->dim;
     size_t nd, expected_data, expected_ids;
     if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &expected_data) ||
         !safe_mul((size_t)n, sizeof(int64_t), &expected_ids)) {
@@ -345,16 +350,15 @@ static ERL_NIF_TERM nif_search_index(ErlNifEnv *env, int argc, const ERL_NIF_TER
         return make_ok(env, enif_make_tuple2(env, empty_d, empty_l));
     }
 
-    enif_rwlock_rlock(res->lock);
-
-    int dim = faiss_Index_d(res->index);
+    /* res->dim needs no lock, so all size checks and result allocations
+     * happen before the read lock — the critical section is just the
+     * faiss_Index_search call. */
+    int dim = res->dim;
     size_t nd, expected;
     if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &expected)) {
-        enif_rwlock_runlock(res->lock);
         return make_error_msg(env, "size overflow");
     }
     if (data_bin.size != expected) {
-        enif_rwlock_runlock(res->lock);
         return make_error_msg(env, "data binary size mismatch");
     }
 
@@ -362,21 +366,19 @@ static ERL_NIF_TERM nif_search_index(ErlNifEnv *env, int argc, const ERL_NIF_TER
     if (!safe_mul((size_t)n, (size_t)k, &nk) ||
         !safe_mul(nk, sizeof(float), &dist_size) ||
         !safe_mul(nk, sizeof(int64_t), &label_size)) {
-        enif_rwlock_runlock(res->lock);
         return make_error_msg(env, "size overflow");
     }
 
     ErlNifBinary distances_bin, labels_bin;
     if (!enif_alloc_binary(dist_size, &distances_bin)) {
-        enif_rwlock_runlock(res->lock);
         return make_error_msg(env, "failed to allocate result binaries");
     }
     if (!enif_alloc_binary(label_size, &labels_bin)) {
-        enif_rwlock_runlock(res->lock);
         enif_release_binary(&distances_bin);
         return make_error_msg(env, "failed to allocate result binaries");
     }
 
+    enif_rwlock_rlock(res->lock);
     int ret = faiss_Index_search(res->index, (idx_t)n,
                                   (const float *)data_bin.data, (idx_t)k,
                                   (float *)distances_bin.data,
@@ -415,7 +417,7 @@ static ERL_NIF_TERM nif_train_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
 
     enif_rwlock_rwlock(res->lock);
 
-    int dim = faiss_Index_d(res->index);
+    int dim = res->dim;
     size_t nd, expected;
     if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &expected)) {
         enif_rwlock_rwunlock(res->lock);
@@ -498,7 +500,7 @@ static ERL_NIF_TERM nif_reconstruct_batch(ErlNifEnv *env, int argc, const ERL_NI
 
     enif_rwlock_rlock(res->lock);
 
-    int dim = faiss_Index_d(res->index);
+    int dim = res->dim;
     size_t nd, result_size;
     if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &result_size)) {
         enif_rwlock_runlock(res->lock);
@@ -559,7 +561,7 @@ static ERL_NIF_TERM nif_compute_residuals(ErlNifEnv *env, int argc, const ERL_NI
 
     enif_rwlock_rlock(res->lock);
 
-    int dim = faiss_Index_d(res->index);
+    int dim = res->dim;
     size_t nd, expected_data, expected_keys;
     if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &expected_data) ||
         !safe_mul((size_t)n, sizeof(int64_t), &expected_keys)) {
@@ -656,17 +658,15 @@ static ERL_NIF_TERM nif_read_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     return make_ok(env, ref);
 }
 
-/* nif_get_index_dim(ref) */
+/* nif_get_index_dim(ref) — reads the immutable cached dim, no lock, so it
+ * stays on a normal scheduler. */
 static ERL_NIF_TERM nif_get_index_dim(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     IndexResource *res;
     if (!enif_get_resource(env, argv[0], INDEX_RESOURCE_TYPE, (void **)&res)) {
         return make_error_msg(env, "invalid index reference");
     }
-    enif_rwlock_rlock(res->lock);
-    int dim = faiss_Index_d(res->index);
-    enif_rwlock_runlock(res->lock);
-    return make_ok(env, enif_make_int(env, dim));
+    return make_ok(env, enif_make_int(env, res->dim));
 }
 
 /* nif_get_index_ntotal(ref) */
@@ -970,8 +970,10 @@ static int on_upgrade(ErlNifEnv *env, void **priv_data, void **old_priv_data, ER
     return register_resource_types(env, ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER);
 }
 
-/* Getters (dim/ntotal/is_trained) run dirty too: they block on the rwlock,
- * and a writer (train/add) may hold it for seconds. */
+/* Getters reading mutable state (ntotal/is_trained) run dirty too: they
+ * block on the rwlock, and a writer (train/add) may hold it for seconds.
+ * The dim getter reads the immutable cached field without the lock, so it
+ * stays on a normal scheduler. */
 static ErlNifFunc nif_funcs[] = {
     /* Index */
     {"nif_new_index", 3, nif_new_index, 0},
@@ -985,7 +987,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_compute_residuals", 4, nif_compute_residuals, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_write_index", 2, nif_write_index, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_read_index", 2, nif_read_index, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"nif_get_index_dim", 1, nif_get_index_dim, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_get_index_dim", 1, nif_get_index_dim, 0},
     {"nif_get_index_ntotal", 1, nif_get_index_ntotal, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_get_index_is_trained", 1, nif_get_index_is_trained, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     /* GPU */

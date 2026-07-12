@@ -45,9 +45,9 @@ Elixir (FaissEx.Index / FaissEx.Clustering)
 
 **NIF resource types:** `FaissIndex`, `FaissClustering`, `FaissGpuResources` (when `FAISS_GPU_ENABLED`). BEAM GC handles cleanup via destructors.
 
-**Locking convention (C layer):** every index/clustering resource carries an `ErlNifRWLock`. Mutations (add/add_with_ids/train/reset/train_clustering) take the write lock; reads (search/reconstruct/residuals/write_index/clone/GPU transfer/centroids/getters) take the read lock. `nif_train_clustering` locks two resources — fixed order: quantizer index first, then clustering. Any NIF that can block on a lock must run on a dirty scheduler.
+**Locking convention (C layer):** every index/clustering resource carries an `ErlNifRWLock`. Mutations (add/add_with_ids/train/reset/train_clustering) take the write lock; reads (search/reconstruct/residuals/write_index/clone/GPU transfer/centroids/ntotal/is_trained getters) take the read lock. The dim getter is lock-free: `IndexResource` caches the immutable `Index::d` at wrap time (`res->dim`), and all size checks use the cache. `nif_train_clustering` locks two resources — fixed order: quantizer index first, then clustering. Any NIF that can block on a lock must run on a dirty scheduler.
 
-**Dirty schedulers:** add, add_with_ids, search, train, reset, reconstruct, residuals, clone, centroids, and the dim/ntotal/is_trained getters → `DIRTY_JOB_CPU_BOUND`; write/read index, GPU transfer → `DIRTY_JOB_IO_BOUND`. Only `nif_new_index`, `nif_new_clustering`, and `nif_get_num_gpus` stay on normal schedulers.
+**Dirty schedulers:** add, add_with_ids, search, train, reset, reconstruct, residuals, clone, centroids, and the ntotal/is_trained getters → `DIRTY_JOB_CPU_BOUND`; write/read index, GPU transfer → `DIRTY_JOB_IO_BOUND`. `nif_new_index`, `nif_new_clustering`, `nif_get_num_gpus`, and `nif_get_index_dim` (immutable cached field, no lock) stay on normal schedulers.
 
 **Data flow:** Elixir encodes lists to f32/s64 binaries via `Shared` → passed to NIF → NIF returns raw binaries → Elixir decodes back to lists.
 
