@@ -8,7 +8,7 @@
 #   MIX_APP_PATH   - set by elixir_make
 
 FAISS_GIT_REPO ?= https://github.com/facebookresearch/faiss.git
-FAISS_GIT_REV  ?= v1.10.0
+FAISS_GIT_REV  ?= v1.14.3
 USE_CUDA       ?= false
 FAISS_OPT_LEVEL ?= generic
 
@@ -42,12 +42,15 @@ NIF_CFLAGS += -I$(ERTS_INCLUDE_DIR)
 NIF_LDFLAGS := -shared
 NIF_LDFLAGS += -L$(LIB_DIR)
 NIF_LDFLAGS += -lfaiss_c -lfaiss
-NIF_LDFLAGS += -lstdc++
 
+# C++ runtime for the transitive libfaiss dependency: LLVM libc++ on macOS,
+# GNU libstdc++ elsewhere
 ifeq ($(UNAME_S),Darwin)
+  NIF_LDFLAGS += -lc++
   NIF_LDFLAGS += -undefined dynamic_lookup
   NIF_LDFLAGS += -Wl,-rpath,@loader_path/lib
 else
+  NIF_LDFLAGS += -lstdc++
   NIF_LDFLAGS += -Wl,-rpath,'$$ORIGIN/lib'
 endif
 

@@ -35,4 +35,15 @@ defmodule FaissEx do
     * `"IVF256,PQ32"` — product quantization (compressed, requires training)
     * `"IDMap,Flat"` — flat index with custom vector IDs
   """
+
+  @doc """
+  Returns the number of available CUDA GPUs.
+
+  Returns `0` when GPU support is not compiled in (the default build).
+  """
+  @spec num_gpus() :: non_neg_integer()
+  def num_gpus do
+    {:ok, n} = FaissEx.NIF.nif_get_num_gpus()
+    n
+  end
 end

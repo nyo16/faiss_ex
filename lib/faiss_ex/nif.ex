@@ -3,8 +3,15 @@ defmodule FaissEx.NIF do
   @on_load :load_nif
 
   defp load_nif do
-    path = :filename.join(:code.priv_dir(:faiss_ex), ~c"libfaiss_ex")
-    :erlang.load_nif(path, 0)
+    case :code.priv_dir(:faiss_ex) do
+      {:error, :bad_name} ->
+        {:error,
+         {:load_failed, ~c"could not find priv dir for :faiss_ex (is the application loaded?)"}}
+
+      priv_dir ->
+        path = :filename.join(priv_dir, ~c"libfaiss_ex")
+        :erlang.load_nif(path, 0)
+    end
   end
 
   # Index

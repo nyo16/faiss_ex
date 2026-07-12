@@ -142,6 +142,26 @@ defmodule FaissEx.IndexTest do
         assert_in_delta expected, actual, 1.0e-6
       end)
     end
+
+    test "reconstructs vectors with non-contiguous keys (per-key fallback)" do
+      {:ok, index} = Index.new(4, "Flat")
+
+      vectors = [
+        [1.0, 2.0, 3.0, 4.0],
+        [5.0, 6.0, 7.0, 8.0],
+        [9.0, 10.0, 11.0, 12.0]
+      ]
+
+      :ok = Index.add(index, vectors)
+
+      # gapped and descending keys must not take the reconstruct_n fast path
+      {:ok, [row2, row0]} = Index.reconstruct(index, [2, 0])
+
+      Enum.zip(Enum.at(vectors, 2) ++ Enum.at(vectors, 0), row2 ++ row0)
+      |> Enum.each(fn {expected, actual} ->
+        assert_in_delta expected, actual, 1.0e-6
+      end)
+    end
   end
 
   describe "to_file/2 and from_file/1" do
@@ -246,7 +266,57 @@ defmodule FaissEx.IndexTest do
     end
   end
 
+  describe "GPU error paths (non-CUDA build)" do
+    @tag :no_cuda
+    test "cpu_to_gpu without GPU support returns error" do
+      {:ok, index} = Index.new(4, "Flat")
+      assert {:error, "GPU support not compiled"} = Index.cpu_to_gpu(index, 0)
+    end
+
+    test "cpu_to_gpu on an index already on GPU returns error" do
+      {:ok, index} = Index.new(4, "Flat")
+      gpu_index = %Index{index | device: {:cuda, 0}}
+      assert {:error, "index already on GPU"} = Index.cpu_to_gpu(gpu_index, 0)
+    end
+  end
+
+  describe "file I/O error paths" do
+    test "to_file into a nonexistent directory returns error" do
+      {:ok, index} = Index.new(4, "Flat")
+      assert {:error, _} = Index.to_file(index, "/nonexistent_dir_faiss_ex/x.index")
+    end
+
+    test "from_file on a nonexistent path returns error" do
+      assert {:error, _} = Index.from_file("/nonexistent_dir_faiss_ex/missing.index")
+    end
+
+    test "from_file sets description to nil" do
+      {:ok, index} = Index.new(4, "Flat")
+      :ok = Index.add(index, [[1.0, 2.0, 3.0, 4.0]])
+      path = Path.join(System.tmp_dir!(), "faiss_ex_desc_#{:rand.uniform(100_000)}.index")
+
+      try do
+        :ok = Index.to_file(index, path)
+        {:ok, loaded} = Index.from_file(path)
+        assert loaded.description == nil
+      after
+        File.rm(path)
+      end
+    end
+  end
+
   describe "edge cases" do
+    test "search with k greater than ntotal pads labels with -1" do
+      {:ok, index} = Index.new(3, "Flat")
+      :ok = Index.add(index, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+
+      {:ok, %{labels: [labels_row]}} = Index.search(index, [1.0, 0.0, 0.0], 5)
+
+      assert length(labels_row) == 5
+      assert Enum.take(labels_row, 2) == [0, 1]
+      assert Enum.drop(labels_row, 2) == [-1, -1, -1]
+    end
+
     test "search returns -1 labels when index is empty" do
       {:ok, index} = Index.new(4, "Flat")
       {:ok, %{labels: [labels_row]}} = Index.search(index, [0.0, 0.0, 0.0, 0.0], 3)
@@ -318,9 +388,85 @@ defmodule FaissEx.IndexTest do
     end
   end
 
-  describe "get_num_gpus" do
-    test "returns a non-negative integer" do
-      {:ok, count} = FaissEx.NIF.nif_get_num_gpus()
+  describe "input validation" do
+    test "raises on invalid metric" do
+      assert_raise ArgumentError,
+                   "invalid metric :cosine, expected :l2 or :inner_product",
+                   fn -> Index.new(4, "Flat", metric: :cosine) end
+    end
+
+    test "raises on ragged batch with the offending row index" do
+      {:ok, index} = Index.new(3, "Flat")
+
+      assert_raise ArgumentError, "row 1 has 2 elements, expected 3", fn ->
+        Index.add(index, [[1.0, 2.0, 3.0], [1.0, 2.0]])
+      end
+    end
+
+    test "raises on short single vector" do
+      {:ok, index} = Index.new(3, "Flat")
+
+      assert_raise ArgumentError, "row 0 has 2 elements, expected 3", fn ->
+        Index.add(index, [1.0, 2.0])
+      end
+    end
+
+    test "raises on non-number element with row index" do
+      {:ok, index} = Index.new(3, "Flat")
+
+      assert_raise ArgumentError, ~s(row 0 contains a non-number: "x"), fn ->
+        Index.add(index, [[1.0, "x", 3.0]])
+      end
+    end
+
+    test "raises on non-list row in a batch" do
+      {:ok, index} = Index.new(3, "Flat")
+
+      assert_raise ArgumentError, ~s(row 1 is not a list of numbers: "bad"), fn ->
+        Index.add(index, [[1.0, 2.0, 3.0], "bad"])
+      end
+    end
+
+    test "adding an empty batch is a no-op" do
+      {:ok, index} = Index.new(4, "Flat")
+      assert :ok = Index.add(index, [])
+      assert {:ok, 0} = Index.ntotal(index)
+    end
+
+    test "add_with_ids with mismatched id count returns error" do
+      {:ok, index} = Index.new(4, "IDMap,Flat")
+
+      assert {:error, "binary size mismatch"} =
+               Index.add_with_ids(
+                 index,
+                 [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+                 [100]
+               )
+    end
+
+    test "rejects non-positive dimension" do
+      assert {:error, "dim must be positive"} = Index.new(0, "Flat")
+      assert {:error, "dim must be positive"} = Index.new(-4, "Flat")
+    end
+
+    test "rejects NUL byte in factory description" do
+      assert {:error, "string contains NUL byte"} = Index.new(4, <<"Flat", 0, "X">>)
+    end
+
+    test "rejects NUL byte in file paths" do
+      {:ok, index} = Index.new(4, "Flat")
+
+      assert {:error, "string contains NUL byte"} =
+               Index.to_file(index, <<"/tmp/bad", 0, "path">>)
+
+      assert {:error, "string contains NUL byte"} =
+               Index.from_file(<<"/tmp/bad", 0, "path">>)
+    end
+  end
+
+  describe "num_gpus" do
+    test "FaissEx.num_gpus/0 returns a non-negative integer" do
+      count = FaissEx.num_gpus()
       assert is_integer(count) and count >= 0
     end
   end

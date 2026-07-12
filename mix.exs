@@ -1,7 +1,7 @@
 defmodule FaissEx.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.2.0"
   @source_url "https://github.com/nyo16/faiss_ex"
 
   def project do
@@ -69,7 +69,7 @@ defmodule FaissEx.MixProject do
       "FAISS_OPT_LEVEL" => System.get_env("FAISS_OPT_LEVEL", "generic"),
       "FAISS_GIT_REPO" =>
         System.get_env("FAISS_GIT_REPO", "https://github.com/facebookresearch/faiss.git"),
-      "FAISS_GIT_REV" => System.get_env("FAISS_GIT_REV", "v1.10.0")
+      "FAISS_GIT_REV" => System.get_env("FAISS_GIT_REV", "v1.14.3")
     }
 
     case System.get_env("FAISS_PREFIX") do

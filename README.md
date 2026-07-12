@@ -17,10 +17,49 @@ Binds to FAISS via its official C API (`libfaiss_c`). No external dependencies b
 
 - Erlang/OTP 27+ with NIF support
 - Elixir 1.18+
-- C/C++ compiler (gcc or clang)
-- **Either** a system FAISS installation **or** CMake 3.17+ to build from source
-- On macOS Apple Silicon: `brew install libomp`
-- For GPU support: CUDA toolkit
+- A C/C++ compiler (clang or gcc)
+- **Either** a system FAISS installation **or** CMake 3.17+ to build from source (the default)
+
+There are no precompiled binaries: the first `mix compile` builds FAISS and the
+NIF from source as shared libraries, cached at `~/.cache/faiss_ex/` (~5–15 min,
+once per FAISS version). Install the platform packages below first.
+
+### macOS setup
+
+```bash
+# Compiler (if you don't have Xcode / command line tools yet)
+xcode-select --install
+
+# Build tools + OpenMP
+brew install cmake libomp
+```
+
+- BLAS comes from the built-in Accelerate framework — nothing to install
+- The build looks for libomp at `$HOMEBREW_PREFIX/opt/libomp` (defaults to
+  `/opt/homebrew` on Apple Silicon); set `HOMEBREW_PREFIX` if yours differs
+
+### Linux setup (Debian/Ubuntu)
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake libopenblas-dev
+```
+
+- `libopenblas-dev` provides the BLAS/LAPACK libraries FAISS links against
+- OpenMP (`libgomp`) ships with gcc — nothing extra to install
+- This is the exact recipe this project's CI uses (ubuntu-22.04)
+
+### Linux setup (Fedora/RHEL)
+
+```bash
+sudo dnf install -y gcc gcc-c++ make cmake openblas-devel
+```
+
+### GPU (optional)
+
+- CUDA toolkit **12.x** — FAISS 1.12.0+ dropped CUDA 11 (see the
+  [GPU Support](#gpu-support) section)
+- Build with `USE_CUDA=true mix compile`
 
 ## Installation
 
@@ -83,7 +122,7 @@ FAISS_PREFIX=/opt/faiss mix compile
 | `FAISS_OPT_LEVEL` | `generic` | SIMD optimization level (see below). Only used when building from source |
 | `USE_CUDA` | `false` | Set to `true` to enable GPU support |
 | `FAISS_GIT_REPO` | `https://github.com/facebookresearch/faiss.git` | FAISS git repository (ignored when `FAISS_PREFIX` is set) |
-| `FAISS_GIT_REV` | `v1.10.0` | FAISS version tag or commit (ignored when `FAISS_PREFIX` is set) |
+| `FAISS_GIT_REV` | `v1.14.3` | FAISS version tag or commit (ignored when `FAISS_PREFIX` is set) |
 
 ### SIMD optimization
 
@@ -105,6 +144,25 @@ rm -rf ~/.cache/faiss_ex && FAISS_OPT_LEVEL=avx2 mix compile
 ```
 
 > **Note:** Apple Silicon (M1-M4) uses NEON which is always enabled — `FAISS_OPT_LEVEL` has no effect on ARM macOS.
+
+### Runtime dependencies (releases & Docker)
+
+The compiled artifact in `priv/` contains the NIF plus **shared** `libfaiss` /
+`libfaiss_c` libraries, which link against system libraries at runtime. If you
+build in one environment and run in another (multi-stage Docker builds, `mix
+release` to a different host), the **runtime** image/host also needs:
+
+- **Linux**: `libopenblas0` and `libgomp1` (plus a matching libc)
+
+  ```dockerfile
+  # in the runtime stage of your Dockerfile
+  RUN apt-get update && apt-get install -y libopenblas0 libgomp1 && rm -rf /var/lib/apt/lists/*
+  ```
+
+- **macOS**: `brew install libomp` (Accelerate is part of the OS)
+
+Build and runtime must use the same OS/architecture — the cached FAISS build is
+not portable across platforms.
 
 ## Usage
 
@@ -351,10 +409,14 @@ nearby = Enum.zip(embeddings, List.flatten(dists))
 
 ## Thread Safety
 
-- **Concurrent reads** (search) on the same index are safe
-- **Concurrent writes** (add) on the same index are **not safe** — serialize writes or use separate indexes
-- Heavy operations (add, search, train) run on BEAM dirty CPU schedulers so they don't block normal Erlang processes
+Indexes can be shared freely across processes — the NIF layer guards every index (and clustering object) with a read-write lock:
+
+- **Concurrent reads** (search, reconstruct, save, clone, property getters) run in parallel with each other
+- **Mutations** (add, train, reset) take the write lock and serialize against all other operations on the same index — racing an `add` against a `search` is safe and cannot crash the VM
+- Heavy operations (add, search, train) run on BEAM dirty CPU schedulers so they don't block normal Erlang processes, even while waiting on the lock
 - File I/O (to_file, from_file) runs on dirty IO schedulers
+
+For write-heavy concurrent workloads, note that mutations are serialized per index — shard across multiple indexes if you need parallel ingestion.
 
 ## Architecture
 
@@ -378,6 +440,22 @@ On macOS, install libomp:
 ```bash
 brew install libomp
 ```
+
+On Linux, OpenMP ships with gcc; make sure `build-essential` (or `gcc-c++`) is installed.
+
+### `Could NOT find BLAS` / `LAPACK not found` during build (Linux)
+
+FAISS needs a BLAS implementation:
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install -y libopenblas-dev
+
+# Fedora/RHEL
+sudo dnf install -y openblas-devel
+```
+
+macOS never needs this — the Accelerate framework provides BLAS.
 
 ### `Library not loaded: libfaiss_c.dylib`
 
@@ -417,6 +495,8 @@ USE_CUDA=true mix compile
 
 This requires the CUDA toolkit to be installed. The build adds `-DFAISS_ENABLE_GPU=ON` to cmake and compiles GPU-specific NIF functions.
 
+> **Note:** FAISS 1.12.0+ (including the pinned v1.14.3) requires **CUDA 12.x** — CUDA 11 support was dropped upstream. If you are stuck on CUDA 11, build with `FAISS_GIT_REV=v1.11.0`.
+
 ### Moving indexes to GPU
 
 ```elixir
@@ -444,7 +524,7 @@ This requires the CUDA toolkit to be installed. The build adds `-DFAISS_ENABLE_G
 ### Checking GPU availability
 
 ```elixir
-{:ok, num_gpus} = FaissEx.NIF.nif_get_num_gpus()
+num_gpus = FaissEx.num_gpus()
 # Returns 0 if not compiled with CUDA or no GPUs available
 ```
 
@@ -463,25 +543,31 @@ USE_CUDA=true mix test --include cuda
 
 ## Benchmarks
 
-Measured on Apple M4 Max (16 cores, 64 GB RAM), Elixir 1.20.0-rc.1, OTP 28.3, FAISS v1.10.0.
+Measured on Apple M4 Max (16 cores, 64 GB RAM), Elixir 1.20.0, OTP 29, FAISS v1.14.3.
 Index: 10,000 vectors, 128 dimensions, Flat L2.
 
 | Operation | ips | avg | median | 99th % |
 |-----------|-----|-----|--------|--------|
-| reconstruct 1 vector | 215.33 K | 4.64 μs | 4.75 μs | 11 μs |
-| add 1 vector | 133.28 K | 7.50 μs | 6.92 μs | 14.54 μs |
-| reconstruct 10 vectors | 23.57 K | 42.42 μs | 42.21 μs | 79.14 μs |
-| compute_residuals 1 vector | 17.00 K | 58.83 μs | 55.92 μs | 124.25 μs |
-| search k=10, 1 query | 12.05 K | 82.95 μs | 80.92 μs | 104.25 μs |
-| compute_residuals 10 vectors | 7.72 K | 129.46 μs | 124.46 μs | 217.88 μs |
-| search k=10, 10 queries | 5.13 K | 194.90 μs | 190.42 μs | 266.53 μs |
-| reconstruct 100 vectors | 1.89 K | 528.36 μs | 499.75 μs | 930.06 μs |
-| compute_residuals 100 vectors | 1.11 K | 903.15 μs | 866.35 μs | 1325.00 μs |
-| search k=10, 100 queries | 0.58 K | 1.72 ms | 1.72 ms | 1.96 ms |
-| add 1000 vectors | 0.38 K | 2.65 ms | 2.58 ms | 3.67 ms |
-| kmeans k=10, 1000 vectors | 0.108 K | 9.22 ms | 9.00 ms | 13.87 ms |
-| kmeans k=50, 1000 vectors | 0.098 K | 10.18 ms | 9.97 ms | 14.32 ms |
-| add 10000 vectors | 0.018 K | 56.52 ms | 55.05 ms | 71.46 ms |
+| reconstruct 1 vector | 141.05 K | 7.09 μs | 6.96 μs | 13.79 μs |
+| add 1 vector | 83.64 K | 11.96 μs | 10.50 μs | 31.17 μs |
+| compute_residuals 1 vector | 17.48 K | 57.21 μs | 54.50 μs | 117.78 μs |
+| reconstruct 10 vectors | 16.68 K | 59.96 μs | 57.75 μs | 118.00 μs |
+| search k=10, 1 query | 8.48 K | 117.94 μs | 114.13 μs | 263.71 μs |
+| compute_residuals 10 vectors | 7.36 K | 135.85 μs | 128.17 μs | 247.56 μs |
+| kmeans assign 100 vectors | 3.87 K | 258.16 μs | 249.75 μs | 494.97 μs |
+| search k=10, 10 queries | 2.97 K | 337.12 μs | 335.83 μs | 381.58 μs |
+| reconstruct 100 vectors | 1.10 K | 911.66 μs | 847.73 μs | 1786.82 μs |
+| compute_residuals 100 vectors | 1.09 K | 914.24 μs | 881.77 μs | 1223.25 μs |
+| search k=10, 100 queries | 0.45 K | 2.20 ms | 2.18 ms | 2.47 ms |
+| kmeans k=50, 1000 vectors | 0.26 K | 3.87 ms | 3.63 ms | 4.70 ms |
+| kmeans k=10, 1000 vectors | 0.22 K | 4.50 ms | 4.09 ms | 5.83 ms |
+| add 1000 vectors | 0.090 K | 11.08 ms | 11.62 ms | 21.81 ms |
+| add 10000 vectors | 0.069 K | 14.45 ms | 13.39 ms | 36.66 ms |
+
+> **Note:** the batch `add` scenarios are dominated by list→binary encoding
+> and BEAM garbage collection of the benchmark corpus, not by FAISS — the
+> NIF-side add of 10,000 vectors is ~0.4 ms. This is also why `add 1000`
+> and `add 10000` land so close together.
 
 Run benchmarks yourself:
 

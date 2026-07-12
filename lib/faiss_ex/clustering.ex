@@ -26,6 +26,16 @@ defmodule FaissEx.Clustering do
 
   defstruct [:ref, :k, :d, :index, :trained?]
 
+  @typedoc """
+  Handle to a FAISS clustering object.
+
+    * `:ref` — NIF resource reference (freed by the BEAM GC)
+    * `:k` — number of clusters
+    * `:d` — vector dimension
+    * `:index` — quantizer index; after `train/2` it holds the `k` centroids
+      and is reused for `get_cluster_assignment/2`
+    * `:trained?` — whether `train/2` has run
+  """
   @type t :: %__MODULE__{
           ref: reference(),
           k: pos_integer(),
@@ -33,6 +43,9 @@ defmodule FaissEx.Clustering do
           index: Index.t() | nil,
           trained?: boolean()
         }
+
+  @typedoc "Error reason reported by FAISS or the NIF layer."
+  @type error :: {:error, String.t()}
 
   @doc """
   Creates a new clustering object.
@@ -42,6 +55,7 @@ defmodule FaissEx.Clustering do
     * `d` - vector dimension
     * `k` - number of clusters
   """
+  @spec new(pos_integer(), pos_integer()) :: {:ok, t()} | error()
   def new(d, k) do
     case NIF.nif_new_clustering(d, k) do
       {:ok, ref} ->
@@ -55,27 +69,26 @@ defmodule FaissEx.Clustering do
   @doc """
   Trains the clustering on the given data.
 
-  Creates a flat index internally for the quantizer.
-  `data` must be a list of lists of floats with inner dimension `d`.
+  Creates a flat index internally for the quantizer; after training it holds
+  the `k` centroids. `data` must be a list of lists of floats with inner
+  dimension `d`.
   """
+  @spec train(t(), [[number()]]) :: {:ok, t()} | error()
   def train(%__MODULE__{ref: ref, d: d} = clustering, data) when is_list(data) do
-    {n, flat} = Shared.to_flat_floats(data)
-    data_bin = Shared.floats_to_binary(flat)
+    {n, data_bin} = Shared.encode_vectors!(data, d)
 
-    {:ok, quantizer} = Index.new(d, "Flat")
-
-    case NIF.nif_train_clustering(ref, n, data_bin, quantizer.ref) do
-      :ok ->
-        {:ok, %__MODULE__{clustering | index: quantizer, trained?: true}}
-
-      {:error, _} = err ->
-        err
+    # On training failure the discarded quantizer is not leaked — its NIF
+    # resource is freed by the BEAM GC via the resource destructor.
+    with {:ok, quantizer} <- Index.new(d, "Flat"),
+         :ok <- NIF.nif_train_clustering(ref, n, data_bin, quantizer.ref) do
+      {:ok, %__MODULE__{clustering | index: quantizer, trained?: true}}
     end
   end
 
   @doc """
   Returns the cluster centroids as a list of lists `[[float]]` with shape `{k, d}`.
   """
+  @spec get_centroids(t()) :: {:ok, [[float()]]} | error()
   def get_centroids(%__MODULE__{ref: ref, d: d}) do
     case NIF.nif_get_clustering_centroids(ref) do
       {:ok, {_k, _d, centroids_bin}} ->
@@ -89,17 +102,19 @@ defmodule FaissEx.Clustering do
   @doc """
   Assigns vectors to their nearest cluster.
 
+  Searches the quantizer index populated during `train/2` — the trained
+  centroids are already indexed, so no per-call rebuild is needed.
+
   Returns `{:ok, %{labels: [[integer]], distances: [[float]]}}`.
   """
+  @spec get_cluster_assignment(t(), Index.vectors()) ::
+          {:ok, %{distances: [[float()]], labels: [[integer()]]}} | error()
   def get_cluster_assignment(%__MODULE__{index: nil}, _data) do
     {:error, "clustering not trained"}
   end
 
-  def get_cluster_assignment(%__MODULE__{d: d} = clustering, data) when is_list(data) do
-    with {:ok, centroids} <- get_centroids(clustering),
-         {:ok, quantizer} <- Index.new(d, "Flat") do
-      :ok = Index.add(quantizer, centroids)
-      Index.search(quantizer, data, 1)
-    end
+  def get_cluster_assignment(%__MODULE__{index: %Index{} = quantizer}, data)
+      when is_list(data) do
+    Index.search(quantizer, data, 1)
   end
 end
