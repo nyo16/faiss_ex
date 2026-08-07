@@ -40,6 +40,21 @@ jobs:
           sed -i "s/@version \".*\"/@version \"${TAG_VERSION}\"/" mix.exs
           grep '@version' mix.exs
 
+      # ---- Release gate -------------------------------------------------
+      # A tag can point at any commit, and CI only runs on pushes/PRs to
+      # master, so without this the tag itself is unverified. FAISS is shared
+      # via ~/.cache/faiss_ex, so the test build only recompiles the NIF.
+      - name: Check formatting
+        run: mix format --check-formatted
+
+      - name: Run tests
+        run: |
+          mix deps.get
+          mix test --include slow
+        env:
+          MIX_ENV: test
+      # -------------------------------------------------------------------
+
       - run: mix deps.get
         env:
           MIX_ENV: dev
@@ -47,6 +62,11 @@ jobs:
       # hex.publish builds docs, which compiles the project (and FAISS from
       # source on a cold cache — ~10 min)
       - run: mix compile
+        env:
+          MIX_ENV: dev
+
+      - name: Validate the package builds
+        run: mix hex.build
         env:
           MIX_ENV: dev
 

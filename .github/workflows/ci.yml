@@ -107,3 +107,46 @@ jobs:
           fail-on-cache-miss: true
 
       - run: mix test --include slow
+
+  # The Makefile carries a substantial darwin-only path — install_name_tool
+  # @rpath/@loader_path rewriting, libomp hints, FAISS_ENABLE_MKL=OFF on
+  # arm64 — that the ubuntu jobs never exercise. macos-14 is Apple Silicon,
+  # which is the variant that has all of it. Self-contained rather than
+  # folded into the setup/restore handoff above: that flow keys its cache on
+  # runner.os and uses fail-on-cache-miss, so a second OS would have to
+  # matrix the whole chain for no benefit.
+  test-macos:
+    name: Tests (macOS arm64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      # cmake ships on the runner image; libomp does not, and the arm64
+      # branch of the Makefile expects it under $(HOMEBREW_PREFIX)/opt/libomp.
+      - name: Install build dependencies
+        run: brew install libomp
+
+      - name: Compute FAISS cache key
+        id: key
+        env:
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          FAISS_REV=$(sed -n 's/^FAISS_GIT_REV *?= *//p' Makefile | tr -d ' ')
+          echo "faiss=${RUNNER_OS}-faiss-${FAISS_REV}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache FAISS build
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/faiss_ex
+          key: ${{ steps.key.outputs.faiss }}
+
+      - run: mix deps.get
+
+      - run: mix compile --warnings-as-errors
+
+      - run: mix test --include slow
