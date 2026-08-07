@@ -41,7 +41,10 @@ _Static_assert(METRIC_L2 == 1, "FaissMetricType renumbered: update FaissEx.Index
  * and its one unlock. Where validation must read locked state
  * (faiss_Clustering_d, faiss_Clustering_centroids), give the function a
  * single `unlock:` label that every branch reaches by goto, releasing
- * multiple locks in the mirror of the acquisition order. Never hand-write
+ * multiple locks in the mirror of the acquisition order. Such a function
+ * records only a status inside the critical section (an int, or a const
+ * char * message) and builds every ERL_NIF_TERM after the release — a lock
+ * must never cover term construction or error formatting. Never hand-write
  * an unlock per error branch: 16 such branches accumulated once already,
  * and one omission wedges the resource forever — nothing in the build or
  * the test suite can catch it.
