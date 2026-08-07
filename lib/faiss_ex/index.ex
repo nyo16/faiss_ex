@@ -125,6 +125,16 @@ defmodule FaissEx.Index do
     * `:metric` - distance metric, `:l2` (default) or `:inner_product`
     * `:device` - `:host` (default) or `{:cuda, device_id}`
 
+  ## Errors
+
+  The two failure modes are deliberately different shapes. An unknown
+  `:metric` raises `ArgumentError` — the atom is a compile-time constant in
+  the caller, so a wrong one is a bug, not a runtime condition. A `dim` or
+  `description` that FAISS rejects returns `{:error, reason}`, because those
+  routinely come from configuration or user input. The same split applies
+  across this module: developer errors raise, FAISS and data errors return
+  error tuples.
+
   ## Examples
 
       iex> {:ok, index} = FaissEx.Index.new(128, "Flat")
@@ -152,9 +162,7 @@ defmodule FaissEx.Index do
                 "invalid metric #{inspect(other)}, expected :l2 or :inner_product"
       end
 
-    desc_bin = to_binary(description)
-
-    with {:ok, ref} <- NIF.nif_new_index(dim, desc_bin, metric_int) do
+    with {:ok, ref} <- NIF.nif_new_index(dim, description, metric_int) do
       index = %__MODULE__{
         dim: dim,
         ref: ref,
@@ -224,14 +232,10 @@ defmodule FaissEx.Index do
   def search(%__MODULE__{ref: ref, dim: dim}, data, k) when is_list(data) do
     {n, data_bin} = Shared.encode_vectors!(data, dim)
 
-    case NIF.nif_search_index(ref, n, data_bin, k) do
-      {:ok, {distances_bin, labels_bin}} ->
-        distances = Shared.binary_to_float_rows(distances_bin, k)
-        labels = Shared.binary_to_int64_rows(labels_bin, k)
-        {:ok, %{distances: distances, labels: labels}}
-
-      {:error, _} = err ->
-        err
+    with {:ok, {distances_bin, labels_bin}} <- NIF.nif_search_index(ref, n, data_bin, k) do
+      distances = Shared.binary_to_float_rows(distances_bin, k)
+      labels = Shared.binary_to_int64_rows(labels_bin, k)
+      {:ok, %{distances: distances, labels: labels}}
     end
   end
 
@@ -251,12 +255,8 @@ defmodule FaissEx.Index do
   def search_binary(%__MODULE__{ref: ref, dim: dim}, queries, k) when is_binary(queries) do
     {n, queries_bin} = encode_vector_data!(queries, dim)
 
-    case NIF.nif_search_index(ref, n, queries_bin, k) do
-      {:ok, {distances_bin, labels_bin}} ->
-        {:ok, %{n: n, distances: distances_bin, labels: labels_bin}}
-
-      {:error, _} = err ->
-        err
+    with {:ok, {distances_bin, labels_bin}} <- NIF.nif_search_index(ref, n, queries_bin, k) do
+      {:ok, %{n: n, distances: distances_bin, labels: labels_bin}}
     end
   end
 
@@ -276,12 +276,8 @@ defmodule FaissEx.Index do
   """
   @spec clone(t()) :: {:ok, t()} | error()
   def clone(%__MODULE__{} = index) do
-    case NIF.nif_clone_index(index.ref) do
-      {:ok, new_ref} ->
-        {:ok, %__MODULE__{index | ref: new_ref, device: :host, gpu_resources_ref: nil}}
-
-      {:error, _} = err ->
-        err
+    with {:ok, new_ref} <- NIF.nif_clone_index(index.ref) do
+      {:ok, %__MODULE__{index | ref: new_ref, device: :host, gpu_resources_ref: nil}}
     end
   end
 
@@ -303,12 +299,8 @@ defmodule FaissEx.Index do
   def reconstruct(%__MODULE__{ref: ref, dim: dim}, keys) when is_list(keys) do
     {n, keys_bin} = Shared.encode_ids!(keys)
 
-    case NIF.nif_reconstruct_batch(ref, n, keys_bin) do
-      {:ok, result_bin} ->
-        {:ok, Shared.binary_to_float_rows(result_bin, dim)}
-
-      {:error, _} = err ->
-        err
+    with {:ok, result_bin} <- NIF.nif_reconstruct_batch(ref, n, keys_bin) do
+      {:ok, Shared.binary_to_float_rows(result_bin, dim)}
     end
   end
 
@@ -331,19 +323,23 @@ defmodule FaissEx.Index do
   Computes residuals: `xs - reconstruct(keys)`.
 
   Returns `{:ok, [[float]]}`.
+
+  Raises `ArgumentError` if a vector does not have `dim` elements, if a key
+  is not an integer, or if the key count does not match the vector count.
   """
   @spec compute_residuals(t(), vectors(), [integer()]) :: {:ok, [[float()]]} | error()
   def compute_residuals(%__MODULE__{ref: ref, dim: dim}, xs, keys)
       when is_list(xs) and is_list(keys) do
     {n, data_bin} = Shared.encode_vectors!(xs, dim)
-    keys_bin = Shared.int64s_to_binary(keys)
+    {n_keys, keys_bin} = Shared.encode_ids!(keys)
 
-    case NIF.nif_compute_residuals(ref, n, data_bin, keys_bin) do
-      {:ok, result_bin} ->
-        {:ok, Shared.binary_to_float_rows(result_bin, dim)}
+    if n_keys != n do
+      raise ArgumentError,
+            "got #{n_keys} keys for #{n} vectors, expected one key per vector"
+    end
 
-      {:error, _} = err ->
-        err
+    with {:ok, result_bin} <- NIF.nif_compute_residuals(ref, n, data_bin, keys_bin) do
+      {:ok, Shared.binary_to_float_rows(result_bin, dim)}
     end
   end
 
@@ -352,7 +348,7 @@ defmodule FaissEx.Index do
   """
   @spec to_file(t(), String.t()) :: :ok | error()
   def to_file(%__MODULE__{ref: ref}, path) do
-    NIF.nif_write_index(ref, to_binary(path))
+    NIF.nif_write_index(ref, path)
   end
 
   @doc """
@@ -369,20 +365,18 @@ defmodule FaissEx.Index do
   def from_file(path, opts \\ []) do
     io_flags = Keyword.get(opts, :io_flags, 0)
 
-    case NIF.nif_read_index(to_binary(path), io_flags) do
-      {:ok, ref} ->
-        {:ok, dim} = NIF.nif_get_index_dim(ref)
+    with {:ok, ref} <- NIF.nif_read_index(path, io_flags) do
+      # Hard match on purpose: we just opened this index, so a failure here
+      # is an invariant violation, not a caller error.
+      {:ok, dim} = NIF.nif_get_index_dim(ref)
 
-        {:ok,
-         %__MODULE__{
-           dim: dim,
-           ref: ref,
-           device: :host,
-           description: nil
-         }}
-
-      {:error, _} = err ->
-        err
+      {:ok,
+       %__MODULE__{
+         dim: dim,
+         ref: ref,
+         device: :host,
+         description: nil
+       }}
     end
   end
 
@@ -413,18 +407,14 @@ defmodule FaissEx.Index do
   def cpu_to_gpu(index, device_id \\ 0)
 
   def cpu_to_gpu(%__MODULE__{device: :host} = index, device_id) do
-    case NIF.nif_index_cpu_to_gpu(index.ref, device_id) do
-      {:ok, {gpu_res_ref, gpu_idx_ref}} ->
-        {:ok,
-         %__MODULE__{
-           index
-           | ref: gpu_idx_ref,
-             device: {:cuda, device_id},
-             gpu_resources_ref: gpu_res_ref
-         }}
-
-      {:error, _} = err ->
-        err
+    with {:ok, {gpu_res_ref, gpu_idx_ref}} <- NIF.nif_index_cpu_to_gpu(index.ref, device_id) do
+      {:ok,
+       %__MODULE__{
+         index
+         | ref: gpu_idx_ref,
+           device: {:cuda, device_id},
+           gpu_resources_ref: gpu_res_ref
+       }}
     end
   end
 
@@ -434,26 +424,25 @@ defmodule FaissEx.Index do
 
   @doc """
   Moves a GPU index back to CPU.
+
+  Returns `{:error, "index already on host"}` if the index is already there.
   """
   @spec gpu_to_cpu(t()) :: {:ok, t()} | error()
   def gpu_to_cpu(%__MODULE__{device: {:cuda, _}} = index) do
-    case NIF.nif_index_gpu_to_cpu(index.ref) do
-      {:ok, cpu_ref} ->
-        {:ok,
-         %__MODULE__{
-           index
-           | ref: cpu_ref,
-             device: :host,
-             gpu_resources_ref: nil
-         }}
-
-      {:error, _} = err ->
-        err
+    with {:ok, cpu_ref} <- NIF.nif_index_gpu_to_cpu(index.ref) do
+      {:ok,
+       %__MODULE__{
+         index
+         | ref: cpu_ref,
+           device: :host,
+           gpu_resources_ref: nil
+       }}
     end
   end
 
-  defp to_binary(str) when is_binary(str), do: str
-  defp to_binary(str) when is_list(str), do: List.to_string(str)
+  def gpu_to_cpu(%__MODULE__{device: :host}) do
+    {:error, "index already on host"}
+  end
 
   defp encode_vector_data!(data, dim) when is_list(data), do: Shared.encode_vectors!(data, dim)
 

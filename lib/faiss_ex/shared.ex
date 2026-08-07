@@ -2,18 +2,8 @@ defmodule FaissEx.Shared do
   @moduledoc false
 
   @doc false
-  def floats_to_binary(list) when is_list(list) do
-    for f <- list, into: <<>>, do: <<f::float-32-native>>
-  end
-
-  @doc false
   def binary_to_floats(bin) when is_binary(bin) do
     for <<f::float-32-native <- bin>>, do: f
-  end
-
-  @doc false
-  def int64s_to_binary(list) when is_list(list) do
-    for i <- list, into: <<>>, do: <<i::signed-native-64>>
   end
 
   @doc false

@@ -57,12 +57,8 @@ defmodule FaissEx.Clustering do
   """
   @spec new(pos_integer(), pos_integer()) :: {:ok, t()} | error()
   def new(d, k) do
-    case NIF.nif_new_clustering(d, k) do
-      {:ok, ref} ->
-        {:ok, %__MODULE__{ref: ref, k: k, d: d, index: nil, trained?: false}}
-
-      {:error, _} = err ->
-        err
+    with {:ok, ref} <- NIF.nif_new_clustering(d, k) do
+      {:ok, %__MODULE__{ref: ref, k: k, d: d, index: nil, trained?: false}}
     end
   end
 
@@ -90,12 +86,8 @@ defmodule FaissEx.Clustering do
   """
   @spec get_centroids(t()) :: {:ok, [[float()]]} | error()
   def get_centroids(%__MODULE__{ref: ref, d: d}) do
-    case NIF.nif_get_clustering_centroids(ref) do
-      {:ok, {_k, _d, centroids_bin}} ->
-        {:ok, Shared.binary_to_float_rows(centroids_bin, d)}
-
-      {:error, _} = err ->
-        err
+    with {:ok, {_k, _d, centroids_bin}} <- NIF.nif_get_clustering_centroids(ref) do
+      {:ok, Shared.binary_to_float_rows(centroids_bin, d)}
     end
   end
 

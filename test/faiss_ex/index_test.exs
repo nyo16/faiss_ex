@@ -228,6 +228,26 @@ defmodule FaissEx.IndexTest do
       |> List.flatten()
       |> Enum.each(fn r -> assert_in_delta r, 0.0, 1.0e-6 end)
     end
+
+    test "raises when the key count does not match the vector count" do
+      {:ok, index} = Index.new(3, "Flat")
+      :ok = Index.add(index, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+      assert_raise ArgumentError,
+                   "got 1 keys for 2 vectors, expected one key per vector",
+                   fn ->
+                     Index.compute_residuals(index, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], [0])
+                   end
+    end
+
+    test "raises when a key is not an integer" do
+      {:ok, index} = Index.new(3, "Flat")
+      :ok = Index.add(index, [[1.0, 2.0, 3.0]])
+
+      assert_raise ArgumentError, "id 0 is not an integer: :nope", fn ->
+        Index.compute_residuals(index, [[1.0, 2.0, 3.0]], [:nope])
+      end
+    end
   end
 
   describe "inner product metric" do
@@ -271,9 +291,14 @@ defmodule FaissEx.IndexTest do
     end
 
     test "cpu_to_gpu on an index already on GPU returns error" do
-      {:ok, index} = Index.new(4, "Flat")
+      {:ok, %Index{} = index} = Index.new(4, "Flat")
       gpu_index = %Index{index | device: {:cuda, 0}}
       assert {:error, "index already on GPU"} = Index.cpu_to_gpu(gpu_index, 0)
+    end
+
+    test "gpu_to_cpu on an index already on the host returns error" do
+      {:ok, index} = Index.new(4, "Flat")
+      assert {:error, "index already on host"} = Index.gpu_to_cpu(index)
     end
   end
 
@@ -525,7 +550,13 @@ defmodule FaissEx.IndexTest do
   describe "binary API" do
     alias FaissEx.Shared
 
-    defp encode(rows), do: rows |> List.flatten() |> Shared.floats_to_binary()
+    defp encode(rows) do
+      for f <- List.flatten(rows), into: <<>>, do: <<f::float-32-native>>
+    end
+
+    defp encode_ids(ids) do
+      for i <- ids, into: <<>>, do: <<i::signed-native-64>>
+    end
 
     test "add with a binary matches add with lists" do
       vectors = for i <- 0..9, do: for(j <- 1..4, do: i * 10.0 + j)
@@ -580,7 +611,7 @@ defmodule FaissEx.IndexTest do
       {:ok, from_lists} = Index.reconstruct(index, [0, 1])
 
       {:ok, bin_from_list_keys} = Index.reconstruct_binary(index, [0, 1])
-      {:ok, bin_from_bin_keys} = Index.reconstruct_binary(index, Shared.int64s_to_binary([0, 1]))
+      {:ok, bin_from_bin_keys} = Index.reconstruct_binary(index, encode_ids([0, 1]))
 
       assert bin_from_list_keys == bin_from_bin_keys
       assert Shared.binary_to_float_rows(bin_from_list_keys, 3) == from_lists
@@ -590,7 +621,7 @@ defmodule FaissEx.IndexTest do
       vectors = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
       ids = [100, 200]
       vectors_bin = encode(vectors)
-      ids_bin = Shared.int64s_to_binary(ids)
+      ids_bin = encode_ids(ids)
 
       combos = [
         {vectors, ids_bin},
