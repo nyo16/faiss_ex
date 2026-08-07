@@ -31,8 +31,10 @@ jobs:
         with:
           path: ~/.cache/faiss_ex
           key: publish-faiss-${{ hashFiles('Makefile') }}
+          # Must track the key CI writes (ci.yml "Compute cache keys"), which
+          # is now arch-qualified. This runner is Linux/amd64 -> Linux-X64-.
           restore-keys: |
-            Linux-faiss-
+            Linux-X64-faiss-
 
       - name: Set version from tag
         run: |
