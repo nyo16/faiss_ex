@@ -34,6 +34,21 @@ _Static_assert(METRIC_L2 == 1, "FaissMetricType renumbered: update FaissEx.Index
  * fixed order is quantizer index first, then clustering. Keep that order
  * everywhere to avoid deadlock.
  *
+ * Unwinding the lock: validate before acquiring it wherever the inputs
+ * allow. Argument size checks read res->dim, the cached immutable
+ * dimension, so those checks and the result enif_alloc_binary belong above
+ * the lock — the critical section then holds nothing but the faiss_* call
+ * and its one unlock. Where validation must read locked state
+ * (faiss_Clustering_d, faiss_Clustering_centroids), give the function a
+ * single `unlock:` label that every branch reaches by goto, releasing
+ * multiple locks in the mirror of the acquisition order. Such a function
+ * records only a status inside the critical section (an int, or a const
+ * char * message) and builds every ERL_NIF_TERM after the release — a lock
+ * must never cover term construction or error formatting. Never hand-write
+ * an unlock per error branch: 16 such branches accumulated once already,
+ * and one omission wedges the resource forever — nothing in the build or
+ * the test suite can catch it.
+ *
  * Every NIF that can block on a lock must run on a dirty scheduler — a
  * writer may hold the lock for seconds (train), and blocking a normal
  * scheduler thread stalls the VM.
@@ -116,11 +131,6 @@ static ERL_NIF_TERM make_ok(ErlNifEnv *env, ERL_NIF_TERM term) {
     return enif_make_tuple2(env, atom_ok, term);
 }
 
-static ERL_NIF_TERM make_ok_atom(ErlNifEnv *env) {
-    (void)env;
-    return atom_ok;
-}
-
 static ERL_NIF_TERM make_error_msg(ErlNifEnv *env, const char *msg) {
     ERL_NIF_TERM bin;
     size_t len = strlen(msg);
@@ -152,6 +162,30 @@ static int safe_mul(size_t a, size_t b, size_t *result) {
  * which would silently truncate after null-termination. */
 static int contains_nul(const ErlNifBinary *bin) {
     return bin->size > 0 && memchr(bin->data, 0, bin->size) != NULL;
+}
+
+/* Copies a binary into a NUL-terminated C string for the FAISS C API.
+ * Returns NULL when out of memory; the caller owns the result and frees it
+ * with enif_free. Guard with contains_nul first — this does not check. */
+static char *dup_cstr(const ErlNifBinary *bin) {
+    char *s = (char *)enif_alloc(bin->size + 1);
+    if (!s) return NULL;
+    memcpy(s, bin->data, bin->size);
+    s[bin->size] = '\0';
+    return s;
+}
+
+/* Rejects reconstruction keys that FAISS will not bounds-check.
+ * IndexFlat::reconstruct tests only `key < ntotal`, which every negative key
+ * passes, so a negative key reads before the codes array and returns heap
+ * contents as vector data. Verified against v1.14.3: reconstruct([-1, -5])
+ * yields garbage floats with no error. The upper bound stays FAISS's job --
+ * it needs ntotal, which needs the lock. */
+static int keys_non_negative(const idx_t *keys, ErlNifSInt64 n) {
+    for (ErlNifSInt64 i = 0; i < n; i++) {
+        if (keys[i] < 0) return 0;
+    }
+    return 1;
 }
 
 /* Wraps a FaissIndex in a resource with its own rwlock.
@@ -195,11 +229,8 @@ static ERL_NIF_TERM nif_new_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     if (dim <= 0) return make_error_msg(env, "dim must be positive");
     if (contains_nul(&desc_bin)) return make_error_msg(env, "string contains NUL byte");
 
-    /* Null-terminate the description string */
-    char *desc = (char *)enif_alloc(desc_bin.size + 1);
+    char *desc = dup_cstr(&desc_bin);
     if (!desc) return make_error_msg(env, "out of memory");
-    memcpy(desc, desc_bin.data, desc_bin.size);
-    desc[desc_bin.size] = '\0';
 
     FaissIndex *index = NULL;
     int ret = faiss_index_factory(&index, dim, desc, (FaissMetricType)metric);
@@ -257,21 +288,19 @@ static ERL_NIF_TERM nif_add_to_index(ErlNifEnv *env, int argc, const ERL_NIF_TER
     if (n < 0) return make_error_msg(env, "n must be non-negative");
     if (n == 0) {
         if (data_bin.size != 0) return make_error_msg(env, "data binary size mismatch");
-        return make_ok_atom(env);
+        return atom_ok;
     }
-
-    enif_rwlock_rwlock(res->lock);
 
     int dim = res->dim;
     size_t nd, expected;
     if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &expected)) {
-        enif_rwlock_rwunlock(res->lock);
         return make_error_msg(env, "size overflow");
     }
     if (data_bin.size != expected) {
-        enif_rwlock_rwunlock(res->lock);
         return make_error_msg(env, "data binary size mismatch");
     }
+
+    enif_rwlock_rwlock(res->lock);
 
     int ret = faiss_Index_add(res->index, (idx_t)n, (const float *)data_bin.data);
     enif_rwlock_rwunlock(res->lock);
@@ -279,7 +308,7 @@ static ERL_NIF_TERM nif_add_to_index(ErlNifEnv *env, int argc, const ERL_NIF_TER
         return make_faiss_error(env, "failed to add vectors");
     }
 
-    return make_ok_atom(env);
+    return atom_ok;
 }
 
 /* nif_add_with_ids_to_index(ref, n, data_binary, ids_binary) */
@@ -301,23 +330,21 @@ static ERL_NIF_TERM nif_add_with_ids_to_index(ErlNifEnv *env, int argc, const ER
         if (data_bin.size != 0 || ids_bin.size != 0) {
             return make_error_msg(env, "binary size mismatch");
         }
-        return make_ok_atom(env);
+        return atom_ok;
     }
-
-    enif_rwlock_rwlock(res->lock);
 
     int dim = res->dim;
     size_t nd, expected_data, expected_ids;
     if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &expected_data) ||
         !safe_mul((size_t)n, sizeof(int64_t), &expected_ids)) {
-        enif_rwlock_rwunlock(res->lock);
         return make_error_msg(env, "size overflow");
     }
 
     if (data_bin.size != expected_data || ids_bin.size != expected_ids) {
-        enif_rwlock_rwunlock(res->lock);
         return make_error_msg(env, "binary size mismatch");
     }
+
+    enif_rwlock_rwlock(res->lock);
 
     int ret = faiss_Index_add_with_ids(res->index, (idx_t)n,
                                         (const float *)data_bin.data,
@@ -327,7 +354,7 @@ static ERL_NIF_TERM nif_add_with_ids_to_index(ErlNifEnv *env, int argc, const ER
         return make_faiss_error(env, "failed to add vectors with ids");
     }
 
-    return make_ok_atom(env);
+    return atom_ok;
 }
 
 /* nif_search_index(ref, n, data_binary, k) */
@@ -419,21 +446,19 @@ static ERL_NIF_TERM nif_train_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     if (n < 0) return make_error_msg(env, "n must be non-negative");
     if (n == 0) {
         if (data_bin.size != 0) return make_error_msg(env, "data binary size mismatch");
-        return make_ok_atom(env);
+        return atom_ok;
     }
-
-    enif_rwlock_rwlock(res->lock);
 
     int dim = res->dim;
     size_t nd, expected;
     if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &expected)) {
-        enif_rwlock_rwunlock(res->lock);
         return make_error_msg(env, "size overflow");
     }
     if (data_bin.size != expected) {
-        enif_rwlock_rwunlock(res->lock);
         return make_error_msg(env, "data binary size mismatch");
     }
+
+    enif_rwlock_rwlock(res->lock);
 
     int ret = faiss_Index_train(res->index, (idx_t)n, (const float *)data_bin.data);
     enif_rwlock_rwunlock(res->lock);
@@ -441,7 +466,7 @@ static ERL_NIF_TERM nif_train_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         return make_faiss_error(env, "training failed");
     }
 
-    return make_ok_atom(env);
+    return atom_ok;
 }
 
 /* nif_reset_index(ref) */
@@ -459,7 +484,7 @@ static ERL_NIF_TERM nif_reset_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         return make_faiss_error(env, "reset failed");
     }
 
-    return make_ok_atom(env);
+    return atom_ok;
 }
 
 /* nif_reconstruct_batch(ref, n, keys_binary) */
@@ -493,6 +518,10 @@ static ERL_NIF_TERM nif_reconstruct_batch(ErlNifEnv *env, int argc, const ERL_NI
 
     const idx_t *keys = (const idx_t *)keys_bin.data;
 
+    if (!keys_non_negative(keys, n)) {
+        return make_error_msg(env, "key out of range");
+    }
+
     /* Contiguous ascending keys (the common case) can use the batched
      * faiss_Index_reconstruct_n instead of one call per key. Unsigned
      * arithmetic: keys are caller-controlled and keys[i-1] + 1 would be
@@ -505,24 +534,29 @@ static ERL_NIF_TERM nif_reconstruct_batch(ErlNifEnv *env, int argc, const ERL_NI
         }
     }
 
-    enif_rwlock_rlock(res->lock);
+    /* reconstruct_n guards with `i0 + ni <= ntotal`, which signed-overflows
+     * to a negative value -- and therefore passes -- once keys[0] nears
+     * INT64_MAX. No real index can hold such a range, so reject it rather
+     * than hand FAISS a bound it computes as UB. */
+    if (contiguous && keys[0] > INT64_MAX - n) {
+        return make_error_msg(env, "key out of range");
+    }
 
     int dim = res->dim;
     size_t nd, result_size;
     if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &result_size)) {
-        enif_rwlock_runlock(res->lock);
         return make_error_msg(env, "size overflow");
     }
 
     ErlNifBinary result_bin;
     if (!enif_alloc_binary(result_size, &result_bin)) {
-        enif_rwlock_runlock(res->lock);
         return make_error_msg(env, "failed to allocate result binary");
     }
 
     float *result = (float *)result_bin.data;
     int ret = 0;
 
+    enif_rwlock_rlock(res->lock);
     if (contiguous) {
         ret = faiss_Index_reconstruct_n(res->index, keys[0], (idx_t)n, result);
     } else {
@@ -566,31 +600,31 @@ static ERL_NIF_TERM nif_compute_residuals(ErlNifEnv *env, int argc, const ERL_NI
         return make_ok(env, empty);
     }
 
-    enif_rwlock_rlock(res->lock);
-
     int dim = res->dim;
     size_t nd, expected_data, expected_keys;
     if (!safe_mul((size_t)n, (size_t)dim, &nd) || !safe_mul(nd, sizeof(float), &expected_data) ||
         !safe_mul((size_t)n, sizeof(int64_t), &expected_keys)) {
-        enif_rwlock_runlock(res->lock);
         return make_error_msg(env, "size overflow");
     }
 
     if (data_bin.size != expected_data || keys_bin.size != expected_keys) {
-        enif_rwlock_runlock(res->lock);
         return make_error_msg(env, "binary size mismatch");
+    }
+
+    const idx_t *keys = (const idx_t *)keys_bin.data;
+    if (!keys_non_negative(keys, n)) {
+        return make_error_msg(env, "key out of range");
     }
 
     ErlNifBinary result_bin;
     if (!enif_alloc_binary(expected_data, &result_bin)) {
-        enif_rwlock_runlock(res->lock);
         return make_error_msg(env, "failed to allocate result binary");
     }
 
     const float *data = (const float *)data_bin.data;
-    const idx_t *keys = (const idx_t *)keys_bin.data;
     float *result = (float *)result_bin.data;
 
+    enif_rwlock_rlock(res->lock);
     int ret = faiss_Index_compute_residual_n(res->index, (idx_t)n, data, result, keys);
     enif_rwlock_runlock(res->lock);
     if (ret != 0) {
@@ -614,10 +648,8 @@ static ERL_NIF_TERM nif_write_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
 
     if (contains_nul(&path_bin)) return make_error_msg(env, "string contains NUL byte");
 
-    char *path = (char *)enif_alloc(path_bin.size + 1);
+    char *path = dup_cstr(&path_bin);
     if (!path) return make_error_msg(env, "out of memory");
-    memcpy(path, path_bin.data, path_bin.size);
-    path[path_bin.size] = '\0';
 
     enif_rwlock_rlock(res->lock);
     int ret = faiss_write_index_fname(res->index, path);
@@ -628,7 +660,7 @@ static ERL_NIF_TERM nif_write_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         return make_faiss_error(env, "failed to write index");
     }
 
-    return make_ok_atom(env);
+    return atom_ok;
 }
 
 /* nif_read_index(path_binary, io_flags) */
@@ -644,10 +676,8 @@ static ERL_NIF_TERM nif_read_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 
     if (contains_nul(&path_bin)) return make_error_msg(env, "string contains NUL byte");
 
-    char *path = (char *)enif_alloc(path_bin.size + 1);
+    char *path = dup_cstr(&path_bin);
     if (!path) return make_error_msg(env, "out of memory");
-    memcpy(path, path_bin.data, path_bin.size);
-    path[path_bin.size] = '\0';
 
     FaissIndex *index = NULL;
     int ret = faiss_read_index_fname(path, io_flags, &index);
@@ -863,32 +893,39 @@ static ERL_NIF_TERM nif_train_clustering(ErlNifEnv *env, int argc, const ERL_NIF
     if (n <= 0) return make_error_msg(env, "n must be positive");
 
     /* Training mutates both the clustering state and the quantizer index.
-     * Lock order: index first, then clustering. */
+     * Lock order: index first, then clustering. faiss_Clustering_d reads the
+     * locked object, so validation cannot be hoisted above the lock. Instead
+     * the critical section records what happened and the single unlock: exit
+     * releases in the mirror order; terms are built afterwards, so the locks
+     * never cover term construction or error formatting. */
+    const char *err = NULL;
+    int ret = 0;
+    int d;
+    size_t nd, expected;
+
     enif_rwlock_rwlock(idx_res->lock);
     enif_rwlock_rwlock(clust_res->lock);
 
-    int d = faiss_Clustering_d(clust_res->clustering);
-    size_t nd, expected;
+    d = faiss_Clustering_d(clust_res->clustering);
     if (!safe_mul((size_t)n, (size_t)d, &nd) || !safe_mul(nd, sizeof(float), &expected)) {
-        enif_rwlock_rwunlock(clust_res->lock);
-        enif_rwlock_rwunlock(idx_res->lock);
-        return make_error_msg(env, "size overflow");
+        err = "size overflow";
+        goto unlock;
     }
     if (data_bin.size != expected) {
-        enif_rwlock_rwunlock(clust_res->lock);
-        enif_rwlock_rwunlock(idx_res->lock);
-        return make_error_msg(env, "data binary size mismatch");
+        err = "data binary size mismatch";
+        goto unlock;
     }
 
-    int ret = faiss_Clustering_train(clust_res->clustering, (idx_t)n,
-                                      (const float *)data_bin.data, idx_res->index);
+    ret = faiss_Clustering_train(clust_res->clustering, (idx_t)n,
+                                  (const float *)data_bin.data, idx_res->index);
+
+unlock:
     enif_rwlock_rwunlock(clust_res->lock);
     enif_rwlock_rwunlock(idx_res->lock);
-    if (ret != 0) {
-        return make_faiss_error(env, "clustering training failed");
-    }
 
-    return make_ok_atom(env);
+    if (err) return make_error_msg(env, err);
+    if (ret != 0) return make_faiss_error(env, "clustering training failed");
+    return atom_ok;
 }
 
 /* nif_get_clustering_centroids(clust_ref) - returns {k, d, centroids_binary} */
@@ -899,40 +936,44 @@ static ERL_NIF_TERM nif_get_clustering_centroids(ErlNifEnv *env, int argc, const
         return make_error_msg(env, "invalid clustering reference");
     }
 
+    /* Every read here touches the locked clustering object -- including the
+     * centroids pointer, which it owns, so the copy stays inside. Only the
+     * result term is built after the single unlock: exit. */
+    const char *err = NULL;
+    size_t k = 0, d = 0, centroids_size = 0, bin_size = 0;
+    float *centroids = NULL;
+    ErlNifBinary bin;
+
     enif_rwlock_rlock(res->lock);
 
-    size_t k = faiss_Clustering_k(res->clustering);
-    size_t d = faiss_Clustering_d(res->clustering);
-
-    float *centroids = NULL;
-    size_t centroids_size = 0;
+    k = faiss_Clustering_k(res->clustering);
+    d = faiss_Clustering_d(res->clustering);
     faiss_Clustering_centroids(res->clustering, &centroids, &centroids_size);
 
     if (!centroids || centroids_size == 0) {
-        enif_rwlock_runlock(res->lock);
-        return make_error_msg(env, "no centroids available");
+        err = "no centroids available";
+        goto unlock;
     }
-
-    size_t bin_size;
     if (!safe_mul(centroids_size, sizeof(float), &bin_size)) {
-        enif_rwlock_runlock(res->lock);
-        return make_error_msg(env, "size overflow");
+        err = "size overflow";
+        goto unlock;
+    }
+    if (!enif_alloc_binary(bin_size, &bin)) {
+        err = "failed to allocate centroids binary";
+        goto unlock;
     }
 
-    ErlNifBinary bin;
-    if (!enif_alloc_binary(bin_size, &bin)) {
-        enif_rwlock_runlock(res->lock);
-        return make_error_msg(env, "failed to allocate centroids binary");
-    }
     memcpy(bin.data, centroids, bin_size);
+
+unlock:
     enif_rwlock_runlock(res->lock);
 
-    ERL_NIF_TERM result = enif_make_tuple3(env,
+    if (err) return make_error_msg(env, err);
+
+    return make_ok(env, enif_make_tuple3(env,
         enif_make_int64(env, (int64_t)k),
         enif_make_int64(env, (int64_t)d),
-        enif_make_binary(env, &bin));
-
-    return make_ok(env, result);
+        enif_make_binary(env, &bin)));
 }
 
 /* ========== NIF Init ========== */

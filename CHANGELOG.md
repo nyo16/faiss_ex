@@ -1,5 +1,76 @@
 # Changelog
 
+## v0.3.1 (2026-08-07)
+
+Lock-discipline hardening and API consistency. No new features.
+
+### Fixed
+
+- **Out-of-bounds read from negative reconstruction keys (memory safety).**
+  FAISS bounds-checks only the upper end of a key: `IndexFlat::reconstruct`
+  tests `key < ntotal`, which every negative key passes, and
+  `IndexFlatCodes::reconstruct_n`'s `i0 + ni <= ntotal` signed-overflows to a
+  negative value — and so passes — once `i0` nears `INT64_MAX`. Either way
+  FAISS read outside the codes array and returned heap contents as vector
+  data. `Index.reconstruct/2`, `reconstruct_binary/2`, and
+  `compute_residuals/3` all reached it from ordinary Elixir; a plain `-1` was
+  enough, and results were non-deterministic between runs. The NIF now
+  rejects negative keys and overflowing contiguous ranges up front with
+  `{:error, "key out of range"}`. Keys past `ntotal` are unaffected — FAISS
+  still reports those itself. Present since v0.1.0.
+- **The NIF lock can no longer be leaked on an error path.** Sixteen early
+  returns each re-typed their own `enif_rwlock_*unlock`; a single omission
+  would have wedged that index forever and blocked a dirty-scheduler thread
+  on every later call, with nothing in the build or test suite able to catch
+  it. Eleven of them are gone — `add`, `add_with_ids`, `train`,
+  `reconstruct`, and `residuals` now validate argument sizes (and allocate
+  the result binary) *before* taking the lock, so their critical section is
+  the bare FAISS call. The remaining five, in `train_clustering` and
+  `get_clustering_centroids`, must read locked state to validate and now use
+  a single `unlock:` exit instead of per-branch unwinds.
+- Shorter critical sections as a side effect: `train` no longer holds the
+  write lock across overflow checks and error formatting, a size-mismatch
+  error now returns immediately rather than queueing behind a contended
+  lock, and the two `unlock:` functions build their result and error terms
+  after releasing, so no lock covers term construction.
+- `Index.gpu_to_cpu/1` on an index already on the host returns
+  `{:error, "index already on host"}` instead of raising
+  `FunctionClauseError` — matching `cpu_to_gpu/2` and the `@spec` that
+  already advertised an error tuple.
+- `Index.compute_residuals/3` validates its keys with the same encoder as
+  `reconstruct/2`. A non-integer key raised an opaque bitstring-construction
+  error and a key/vector count mismatch degraded into the C layer's
+  `{:error, "binary size mismatch"}`; both now raise `ArgumentError` naming
+  the offending value or the two counts.
+
+### Changed
+
+- `Index.to_file/2`, `Index.from_file/2`, and `Index.new/3` no longer accept
+  charlist paths and factory strings. This was undocumented and untested —
+  every `@spec` involved already said `String.t()`. Pass a binary, or
+  `List.to_string/1` a charlist at the call site.
+- The ten `case`-with-passthrough-error-clause wrappers in
+  `FaissEx.Index`/`FaissEx.Clustering` are now `with` expressions. Behavior
+  is identical; note that `Index.new/3`'s inferred return type is now
+  `dynamic()` rather than a closed union, so struct-update syntax on its
+  result needs an explicit `%Index{} = index` match to satisfy the type
+  checker.
+- `Index.new/3` documents its error discipline: an unknown `:metric` raises
+  `ArgumentError`, while a FAISS-rejected `dim` or `description` returns
+  `{:error, reason}`. The note is explicit that the raise/tuple split is
+  *not* uniform across the module — `add_with_ids/3` returns a tuple for an
+  id count mismatch where `compute_residuals/3` raises.
+
+### Internal
+
+- `credo` added as a dev/test dependency.
+- `FaissEx.Shared.floats_to_binary/1` and `int64s_to_binary/1` removed —
+  they had no production callers and shipped in the hex package as test
+  fixtures. They are now private helpers in the test files. `Shared` is
+  `@moduledoc false`, so this is not a public API change.
+- C: `dup_cstr/1` replaces three copies of the alloc/memcpy/NUL-terminate
+  block; `make_ok_atom/1` deleted in favour of the `atom_ok` global.
+
 ## v0.3.0 (2026-07-12)
 
 Binary fast-path API and encode/decode optimizations.

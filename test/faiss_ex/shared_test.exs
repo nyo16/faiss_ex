@@ -9,7 +9,7 @@ defmodule FaissEx.SharedTest do
     end
 
     test "decodes a single row" do
-      bin = Shared.floats_to_binary([1.0, 2.0, 3.0])
+      bin = floats_to_binary([1.0, 2.0, 3.0])
       assert Shared.binary_to_float_rows(bin, 3) == [[1.0, 2.0, 3.0]]
     end
 
@@ -25,7 +25,7 @@ defmodule FaissEx.SharedTest do
       decoded =
         rows
         |> List.flatten()
-        |> Shared.floats_to_binary()
+        |> floats_to_binary()
         |> Shared.binary_to_float_rows(3)
 
       Enum.zip(List.flatten(rows), List.flatten(decoded))
@@ -36,7 +36,7 @@ defmodule FaissEx.SharedTest do
 
     test "matches binary_to_floats plus chunking" do
       floats = Enum.map(1..12, &(&1 * 1.0))
-      bin = Shared.floats_to_binary(floats)
+      bin = floats_to_binary(floats)
 
       assert Shared.binary_to_float_rows(bin, 4) ==
                bin |> Shared.binary_to_floats() |> Enum.chunk_every(4)
@@ -51,7 +51,7 @@ defmodule FaissEx.SharedTest do
     test "round-trips rows of int64s including negatives" do
       rows = [[0, -1, 9_223_372_036_854_775_807], [-9_223_372_036_854_775_808, 42, 7]]
 
-      bin = rows |> List.flatten() |> Shared.int64s_to_binary()
+      bin = rows |> List.flatten() |> int64s_to_binary()
       assert Shared.binary_to_int64_rows(bin, 3) == rows
     end
   end
@@ -61,10 +61,10 @@ defmodule FaissEx.SharedTest do
       assert Shared.encode_ids!([]) == {0, <<>>}
     end
 
-    test "returns the count and the same binary as int64s_to_binary" do
+    test "returns the count and the same binary as a naive s64 comprehension" do
       ids = [100, -5, 0, 9_999_999_999]
       assert {4, bin} = Shared.encode_ids!(ids)
-      assert bin == Shared.int64s_to_binary(ids)
+      assert bin == int64s_to_binary(ids)
       assert Shared.binary_to_int64s(bin) == ids
     end
 
@@ -73,5 +73,17 @@ defmodule FaissEx.SharedTest do
         Shared.encode_ids!([1, 2, 3.5])
       end
     end
+  end
+
+  # Reference encoders. These live here rather than in FaissEx.Shared because
+  # production code has no callers for them — encode_ids!/1 and
+  # encode_vectors!/2 are the real encoders, and these are what they are
+  # asserted against.
+  defp floats_to_binary(list) do
+    for f <- list, into: <<>>, do: <<f::float-32-native>>
+  end
+
+  defp int64s_to_binary(list) do
+    for i <- list, into: <<>>, do: <<i::signed-native-64>>
   end
 end
