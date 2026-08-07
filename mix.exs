@@ -1,7 +1,7 @@
 defmodule FaissEx.MixProject do
   use Mix.Project
 
-  @version "0.3.0"
+  @version "0.3.1"
   @source_url "https://github.com/nyo16/faiss_ex"
 
   # Keep rev+SHA in sync with Makefile. The SHA is what the tag must resolve
@@ -64,7 +64,8 @@ defmodule FaissEx.MixProject do
     [
       {:elixir_make, "~> 0.9", runtime: false},
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},
-      {:benchee, "~> 1.3", only: :dev, runtime: false}
+      {:benchee, "~> 1.3", only: :dev, runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
   end
 

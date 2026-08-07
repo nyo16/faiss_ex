@@ -1,0 +1,87 @@
+---
+module: "FaissEx.NIF"
+date: "2026-07-11"
+problem_type: otp_issue
+component: nif
+symptoms:
+  - "Two Elixir processes racing add/train/reset against search on one shared FAISS index could segfault the whole VM (undefined behavior in the C++ library)"
+  - "After adding locks: a trivial getter NIF (ntotal/dim/is_trained) on a normal scheduler can block for seconds behind a writer's lock, stalling a BEAM scheduler thread"
+root_cause: "C libraries like FAISS are not thread-safe for mutation-vs-read races, so NIF resources need a lock; but once a NIF can block on that lock, its worst-case runtime is the longest writer hold (seconds for train), so even microsecond getters violate the 1ms normal-scheduler rule"
+severity: critical
+tags: [nif, rwlock, dirty-scheduler, thread-safety, erl-nif, segfault, lock-ordering]
+---
+
+# NIF resources wrapping non-thread-safe C objects need a rwlock — and then every lock-taking NIF must go dirty
+
+## Symptoms
+
+- FAISS index shared between processes: concurrent `add`/`train`/`reset` vs
+  `search` is undefined behavior in the C++ layer — can crash the entire VM
+  (no error tuple, no rescue possible).
+- Subtle follow-on: after adding the lock, "cheap" getters
+  (`nif_get_index_ntotal` etc., flag `0` = normal scheduler) acquire the read
+  lock. If a writer holds the lock for a multi-second `train`, the getter
+  blocks a normal scheduler thread → scheduler collapse warnings / stalled VM.
+
+## Investigation
+
+1. **Mutex per resource** — rejected: FAISS search is itself OpenMP-parallel
+   and read-heavy workloads want concurrent searches. `ErlNifRWLock` keeps
+   reads parallel.
+2. **Lock only the mutations** — insufficient: readers must hold the read
+   lock too, or a mutation can still race them.
+3. **Leave getters on normal schedulers** — wrong: blocking on a lock has
+   unbounded latency; the 1ms rule applies to worst case, not typical case.
+
+## Root Cause
+
+The BEAM gives you memory lifecycle for NIF resources (destructors) but no
+concurrency control. Any C object that is not internally synchronized needs a
+lock in the resource struct. Once that lock exists, **the scheduler flag of a
+NIF is determined by its worst-case lock wait, not by its own work**.
+
+## Solution
+
+Pattern applied in `c_src/faiss_ex_nif.c`:
+
+```c
+typedef struct {
+    FaissIndex *index;
+    ErlNifRWLock *lock;   /* created at every alloc site, destroyed in destructor */
+} IndexResource;
+
+/* mutations */ enif_rwlock_rwlock(res->lock);  ... enif_rwlock_rwunlock(res->lock);
+/* reads     */ enif_rwlock_rlock(res->lock);   ... enif_rwlock_runlock(res->lock);
+```
+
+Rules that made it correct:
+
+- A `wrap_index_resource` helper owns the create-lock/alloc-resource/on-failure
+  cleanup sequence so no alloc site can forget the lock.
+- Every early-return error path unlocks first (audit each `return` inside the
+  locked region).
+- Only one function takes two locks (`nif_train_clustering`); a fixed,
+  documented order (quantizer index → clustering) prevents deadlock.
+- **Every NIF that can block on the lock is `ERL_NIF_DIRTY_JOB_CPU_BOUND` —
+  including the one-line getters.**
+- `faiss_get_last_error()` is thread-local, so reading it after unlock on the
+  same dirty-scheduler thread is safe (re-verify on FAISS bumps).
+
+### Files Changed
+
+- `c_src/faiss_ex_nif.c` — locks + scheduler flags (commit 8214947)
+- `test/faiss_ex/concurrency_test.exs` — randomized-op stress test + a
+  train-vs-search race on a shared IVF index (`mix test --include slow`)
+
+## Prevention
+
+- CLAUDE.md now documents the locking convention and the dirty-scheduler rule.
+- Specific guidance: when reviewing a new NIF in this repo ask two questions —
+  "does it touch `res->index`/`res->clustering`? then it takes the lock" and
+  "does it take the lock? then it must be dirty".
+- Stress-test template: N processes × random ops per iteration on one shared
+  resource; assert no crash AND the resource still works afterwards.
+
+## Related
+
+- `.claude/solutions/performance-issues/benchee-batch-numbers-gc-dominated-faissex-20260711.md`
