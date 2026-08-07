@@ -6,6 +6,18 @@ Lock-discipline hardening and API consistency. No new features.
 
 ### Fixed
 
+- **Out-of-bounds read from negative reconstruction keys (memory safety).**
+  FAISS bounds-checks only the upper end of a key: `IndexFlat::reconstruct`
+  tests `key < ntotal`, which every negative key passes, and
+  `IndexFlatCodes::reconstruct_n`'s `i0 + ni <= ntotal` signed-overflows to a
+  negative value — and so passes — once `i0` nears `INT64_MAX`. Either way
+  FAISS read outside the codes array and returned heap contents as vector
+  data. `Index.reconstruct/2`, `reconstruct_binary/2`, and
+  `compute_residuals/3` all reached it from ordinary Elixir; a plain `-1` was
+  enough, and results were non-deterministic between runs. The NIF now
+  rejects negative keys and overflowing contiguous ranges up front with
+  `{:error, "key out of range"}`. Keys past `ntotal` are unaffected — FAISS
+  still reports those itself. Present since v0.1.0.
 - **The NIF lock can no longer be leaked on an error path.** Sixteen early
   returns each re-typed their own `enif_rwlock_*unlock`; a single omission
   would have wedged that index forever and blocked a dirty-scheduler thread
@@ -17,9 +29,10 @@ Lock-discipline hardening and API consistency. No new features.
   `get_clustering_centroids`, must read locked state to validate and now use
   a single `unlock:` exit instead of per-branch unwinds.
 - Shorter critical sections as a side effect: `train` no longer holds the
-  write lock across overflow checks and error formatting, and a
-  size-mismatch error now returns immediately rather than queueing behind a
-  contended lock.
+  write lock across overflow checks and error formatting, a size-mismatch
+  error now returns immediately rather than queueing behind a contended
+  lock, and the two `unlock:` functions build their result and error terms
+  after releasing, so no lock covers term construction.
 - `Index.gpu_to_cpu/1` on an index already on the host returns
   `{:error, "index already on host"}` instead of raising
   `FunctionClauseError` — matching `cpu_to_gpu/2` and the `@spec` that
@@ -43,8 +56,10 @@ Lock-discipline hardening and API consistency. No new features.
   result needs an explicit `%Index{} = index` match to satisfy the type
   checker.
 - `Index.new/3` documents its error discipline: an unknown `:metric` raises
-  `ArgumentError` (developer error), while a FAISS-rejected `dim` or
-  `description` returns `{:error, reason}`.
+  `ArgumentError`, while a FAISS-rejected `dim` or `description` returns
+  `{:error, reason}`. The note is explicit that the raise/tuple split is
+  *not* uniform across the module — `add_with_ids/3` returns a tuple for an
+  id count mismatch where `compute_residuals/3` raises.
 
 ### Internal
 

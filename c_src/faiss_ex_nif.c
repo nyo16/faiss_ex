@@ -172,6 +172,19 @@ static char *dup_cstr(const ErlNifBinary *bin) {
     return s;
 }
 
+/* Rejects reconstruction keys that FAISS will not bounds-check.
+ * IndexFlat::reconstruct tests only `key < ntotal`, which every negative key
+ * passes, so a negative key reads before the codes array and returns heap
+ * contents as vector data. Verified against v1.14.3: reconstruct([-1, -5])
+ * yields garbage floats with no error. The upper bound stays FAISS's job --
+ * it needs ntotal, which needs the lock. */
+static int keys_non_negative(const idx_t *keys, ErlNifSInt64 n) {
+    for (ErlNifSInt64 i = 0; i < n; i++) {
+        if (keys[i] < 0) return 0;
+    }
+    return 1;
+}
+
 /* Wraps a FaissIndex in a resource with its own rwlock.
  * Takes ownership: frees the index and returns 0 on failure. */
 static int wrap_index_resource(ErlNifEnv *env, FaissIndex *index, ERL_NIF_TERM *ref_out) {
@@ -502,6 +515,10 @@ static ERL_NIF_TERM nif_reconstruct_batch(ErlNifEnv *env, int argc, const ERL_NI
 
     const idx_t *keys = (const idx_t *)keys_bin.data;
 
+    if (!keys_non_negative(keys, n)) {
+        return make_error_msg(env, "key out of range");
+    }
+
     /* Contiguous ascending keys (the common case) can use the batched
      * faiss_Index_reconstruct_n instead of one call per key. Unsigned
      * arithmetic: keys are caller-controlled and keys[i-1] + 1 would be
@@ -512,6 +529,14 @@ static ERL_NIF_TERM nif_reconstruct_batch(ErlNifEnv *env, int argc, const ERL_NI
             contiguous = 0;
             break;
         }
+    }
+
+    /* reconstruct_n guards with `i0 + ni <= ntotal`, which signed-overflows
+     * to a negative value -- and therefore passes -- once keys[0] nears
+     * INT64_MAX. No real index can hold such a range, so reject it rather
+     * than hand FAISS a bound it computes as UB. */
+    if (contiguous && keys[0] > INT64_MAX - n) {
+        return make_error_msg(env, "key out of range");
     }
 
     int dim = res->dim;
@@ -583,13 +608,17 @@ static ERL_NIF_TERM nif_compute_residuals(ErlNifEnv *env, int argc, const ERL_NI
         return make_error_msg(env, "binary size mismatch");
     }
 
+    const idx_t *keys = (const idx_t *)keys_bin.data;
+    if (!keys_non_negative(keys, n)) {
+        return make_error_msg(env, "key out of range");
+    }
+
     ErlNifBinary result_bin;
     if (!enif_alloc_binary(expected_data, &result_bin)) {
         return make_error_msg(env, "failed to allocate result binary");
     }
 
     const float *data = (const float *)data_bin.data;
-    const idx_t *keys = (const idx_t *)keys_bin.data;
     float *result = (float *)result_bin.data;
 
     enif_rwlock_rlock(res->lock);
@@ -862,10 +891,13 @@ static ERL_NIF_TERM nif_train_clustering(ErlNifEnv *env, int argc, const ERL_NIF
 
     /* Training mutates both the clustering state and the quantizer index.
      * Lock order: index first, then clustering. faiss_Clustering_d reads the
-     * locked object, so validation cannot be hoisted above the lock — the
-     * single unlock: exit releases in the mirror order instead. */
-    ERL_NIF_TERM result;
-    int d, ret;
+     * locked object, so validation cannot be hoisted above the lock. Instead
+     * the critical section records what happened and the single unlock: exit
+     * releases in the mirror order; terms are built afterwards, so the locks
+     * never cover term construction or error formatting. */
+    const char *err = NULL;
+    int ret = 0;
+    int d;
     size_t nd, expected;
 
     enif_rwlock_rwlock(idx_res->lock);
@@ -873,22 +905,24 @@ static ERL_NIF_TERM nif_train_clustering(ErlNifEnv *env, int argc, const ERL_NIF
 
     d = faiss_Clustering_d(clust_res->clustering);
     if (!safe_mul((size_t)n, (size_t)d, &nd) || !safe_mul(nd, sizeof(float), &expected)) {
-        result = make_error_msg(env, "size overflow");
+        err = "size overflow";
         goto unlock;
     }
     if (data_bin.size != expected) {
-        result = make_error_msg(env, "data binary size mismatch");
+        err = "data binary size mismatch";
         goto unlock;
     }
 
     ret = faiss_Clustering_train(clust_res->clustering, (idx_t)n,
                                   (const float *)data_bin.data, idx_res->index);
-    result = ret == 0 ? atom_ok : make_faiss_error(env, "clustering training failed");
 
 unlock:
     enif_rwlock_rwunlock(clust_res->lock);
     enif_rwlock_rwunlock(idx_res->lock);
-    return result;
+
+    if (err) return make_error_msg(env, err);
+    if (ret != 0) return make_faiss_error(env, "clustering training failed");
+    return atom_ok;
 }
 
 /* nif_get_clustering_centroids(clust_ref) - returns {k, d, centroids_binary} */
@@ -899,11 +933,11 @@ static ERL_NIF_TERM nif_get_clustering_centroids(ErlNifEnv *env, int argc, const
         return make_error_msg(env, "invalid clustering reference");
     }
 
-    /* Every read here touches the locked clustering object — including the
-     * centroids pointer, which is owned by it — so nothing can be hoisted.
-     * Single unlock: exit. */
-    ERL_NIF_TERM result;
-    size_t k, d, centroids_size = 0, bin_size;
+    /* Every read here touches the locked clustering object -- including the
+     * centroids pointer, which it owns, so the copy stays inside. Only the
+     * result term is built after the single unlock: exit. */
+    const char *err = NULL;
+    size_t k = 0, d = 0, centroids_size = 0, bin_size = 0;
     float *centroids = NULL;
     ErlNifBinary bin;
 
@@ -914,27 +948,29 @@ static ERL_NIF_TERM nif_get_clustering_centroids(ErlNifEnv *env, int argc, const
     faiss_Clustering_centroids(res->clustering, &centroids, &centroids_size);
 
     if (!centroids || centroids_size == 0) {
-        result = make_error_msg(env, "no centroids available");
+        err = "no centroids available";
         goto unlock;
     }
     if (!safe_mul(centroids_size, sizeof(float), &bin_size)) {
-        result = make_error_msg(env, "size overflow");
+        err = "size overflow";
         goto unlock;
     }
     if (!enif_alloc_binary(bin_size, &bin)) {
-        result = make_error_msg(env, "failed to allocate centroids binary");
+        err = "failed to allocate centroids binary";
         goto unlock;
     }
 
     memcpy(bin.data, centroids, bin_size);
-    result = make_ok(env, enif_make_tuple3(env,
-        enif_make_int64(env, (int64_t)k),
-        enif_make_int64(env, (int64_t)d),
-        enif_make_binary(env, &bin)));
 
 unlock:
     enif_rwlock_runlock(res->lock);
-    return result;
+
+    if (err) return make_error_msg(env, err);
+
+    return make_ok(env, enif_make_tuple3(env,
+        enif_make_int64(env, (int64_t)k),
+        enif_make_int64(env, (int64_t)d),
+        enif_make_binary(env, &bin)));
 }
 
 /* ========== NIF Init ========== */

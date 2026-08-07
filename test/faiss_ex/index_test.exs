@@ -229,6 +229,26 @@ defmodule FaissEx.IndexTest do
       |> Enum.each(fn r -> assert_in_delta r, 0.0, 1.0e-6 end)
     end
 
+    test "residual against a different key is the vector difference" do
+      # Key 0 is byte-order invariant and yields an all-zero residual, so the
+      # identity case above passes even if keys are byte-swapped or ignored.
+      # This one only passes if the key actually selects vector 1.
+      {:ok, index} = Index.new(3, "Flat")
+      :ok = Index.add(index, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+      assert {:ok, [[a, b, c]]} = Index.compute_residuals(index, [[1.0, 2.0, 3.0]], [1])
+
+      Enum.each([a, b, c], &assert_in_delta(&1, -3.0, 1.0e-6))
+    end
+
+    test "a negative key is rejected instead of reading out of bounds" do
+      {:ok, index} = Index.new(3, "Flat")
+      :ok = Index.add(index, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+      assert {:error, "key out of range"} =
+               Index.compute_residuals(index, [[0.0, 0.0, 0.0]], [-1])
+    end
+
     test "raises when the key count does not match the vector count" do
       {:ok, index} = Index.new(3, "Flat")
       :ok = Index.add(index, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
@@ -550,14 +570,6 @@ defmodule FaissEx.IndexTest do
   describe "binary API" do
     alias FaissEx.Shared
 
-    defp encode(rows) do
-      for f <- List.flatten(rows), into: <<>>, do: <<f::float-32-native>>
-    end
-
-    defp encode_ids(ids) do
-      for i <- ids, into: <<>>, do: <<i::signed-native-64>>
-    end
-
     test "add with a binary matches add with lists" do
       vectors = for i <- 0..9, do: for(j <- 1..4, do: i * 10.0 + j)
 
@@ -682,5 +694,63 @@ defmodule FaissEx.IndexTest do
       count = FaissEx.num_gpus()
       assert is_integer(count) and count >= 0
     end
+  end
+
+  describe "reconstruction key range" do
+    # FAISS bounds-checks only the upper end: IndexFlat::reconstruct tests
+    # `key < ntotal`, which every negative key passes, and reconstruct_n's
+    # `i0 + ni <= ntotal` signed-overflows near INT64_MAX and passes too.
+    # Both read out of bounds and return heap contents as vector data, so the
+    # NIF rejects them before calling FAISS.
+    @max_int64 9_223_372_036_854_775_807
+
+    setup do
+      {:ok, index} = Index.new(3, "Flat")
+      :ok = Index.add(index, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+      %{index: index}
+    end
+
+    test "rejects a negative key on the batched path", %{index: index} do
+      assert {:error, "key out of range"} = Index.reconstruct(index, [-1])
+    end
+
+    test "rejects a negative key on the per-key path", %{index: index} do
+      # Non-contiguous, so this goes through faiss_Index_reconstruct one key
+      # at a time — the path with no bounds check at all.
+      assert {:error, "key out of range"} = Index.reconstruct(index, [-1, -5])
+    end
+
+    test "rejects a key range whose end overflows int64", %{index: index} do
+      assert {:error, "key out of range"} = Index.reconstruct(index, [@max_int64])
+
+      assert {:error, "key out of range"} =
+               Index.reconstruct(index, [@max_int64 - 1, @max_int64])
+    end
+
+    test "rejects a negative key through reconstruct_binary/2", %{index: index} do
+      assert {:error, "key out of range"} = Index.reconstruct_binary(index, [-1])
+    end
+
+    test "still reconstructs valid keys, contiguous and not", %{index: index} do
+      assert {:ok, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]} = Index.reconstruct(index, [0, 1])
+      assert {:ok, [[4.0, 5.0, 6.0], [1.0, 2.0, 3.0]]} = Index.reconstruct(index, [1, 0])
+    end
+
+    test "still lets FAISS reject a key past ntotal", %{index: index} do
+      assert {:error, message} = Index.reconstruct(index, [5])
+      assert message =~ "ntotal"
+    end
+  end
+
+  # Reference encoders, module-level so the scoping matches reality: `defp`
+  # inside a `describe` compiles into the module regardless. Kept local rather
+  # than in `test/support/` — the project has no `elixirc_paths` override and
+  # these are one-line comprehensions.
+  defp encode(rows) do
+    for f <- List.flatten(rows), into: <<>>, do: <<f::float-32-native>>
+  end
+
+  defp encode_ids(ids) do
+    for i <- ids, into: <<>>, do: <<i::signed-native-64>>
   end
 end

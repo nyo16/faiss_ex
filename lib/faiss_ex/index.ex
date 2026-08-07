@@ -128,12 +128,15 @@ defmodule FaissEx.Index do
   ## Errors
 
   The two failure modes are deliberately different shapes. An unknown
-  `:metric` raises `ArgumentError` — the atom is a compile-time constant in
-  the caller, so a wrong one is a bug, not a runtime condition. A `dim` or
-  `description` that FAISS rejects returns `{:error, reason}`, because those
-  routinely come from configuration or user input. The same split applies
-  across this module: developer errors raise, FAISS and data errors return
-  error tuples.
+  `:metric` raises `ArgumentError`, because the set of valid metrics is
+  fixed by this library and a wrong one cannot be handled at runtime. A
+  `dim` or `description` that FAISS rejects returns `{:error, reason}`,
+  because those routinely come from configuration or user input.
+
+  This split is not uniform across the module: `add_with_ids/3` returns
+  `{:error, "binary size mismatch"}` for an id/vector count mismatch, while
+  `compute_residuals/3` raises for the same mistake. Check each function's
+  own docs.
 
   ## Examples
 
@@ -292,8 +295,9 @@ defmodule FaissEx.Index do
   @doc """
   Reconstructs vectors at the given keys.
 
-  `keys` is a list of integer indices.
-  Returns `{:ok, [[float]]}` with shape n * dim.
+  `keys` is a list of integer indices. Returns `{:ok, [[float]]}` with shape
+  n * dim, or `{:error, "key out of range"}` for a negative key or a
+  contiguous range that cannot address any index.
   """
   @spec reconstruct(t(), [integer()]) :: {:ok, [[float()]]} | error()
   def reconstruct(%__MODULE__{ref: ref, dim: dim}, keys) when is_list(keys) do
@@ -311,6 +315,7 @@ defmodule FaissEx.Index do
   `keys` is a list of integers or an `s64-native` binary. Returns
   `{:ok, binary}` where the binary is `n * dim` `f32-native` floats,
   row-major — useful for bulk export without decode-then-chunk overhead.
+  Returns `{:error, "key out of range"}` for a negative key.
   """
   @spec reconstruct_binary(t(), id_data()) :: {:ok, binary()} | error()
   def reconstruct_binary(%__MODULE__{ref: ref}, keys)
@@ -322,7 +327,8 @@ defmodule FaissEx.Index do
   @doc """
   Computes residuals: `xs - reconstruct(keys)`.
 
-  Returns `{:ok, [[float]]}`.
+  Returns `{:ok, [[float]]}`, or `{:error, "key out of range"}` for a
+  negative key.
 
   Raises `ArgumentError` if a vector does not have `dim` elements, if a key
   is not an integer, or if the key count does not match the vector count.
