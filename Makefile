@@ -6,6 +6,8 @@
 #   FAISS_GIT_REV  - FAISS git revision/tag to build (ignored when FAISS_PREFIX is set)
 #   FAISS_GIT_SHA  - commit FAISS_GIT_REV must resolve to; empty skips verification
 #   USE_CUDA       - "true" to enable GPU support
+#   LIBOMP_PREFIX  - macOS only: path to the libomp keg; auto-detected via
+#                    `brew --prefix libomp` when unset
 #   MIX_APP_PATH   - set by elixir_make
 
 FAISS_GIT_REPO ?= https://github.com/facebookresearch/faiss.git
@@ -92,15 +94,26 @@ else
   CMAKE_FLAGS += -DFAISS_ENABLE_GPU=OFF
 endif
 
-# macOS Apple Silicon: no MKL, need OpenMP hints
+# macOS: AppleClang ships no OpenMP runtime on *either* architecture, so FAISS
+# has to be pointed at Homebrew's libomp. Ask brew for the keg rather than
+# guessing a prefix — `HOMEBREW_PREFIX ?= ...` silently loses to a stale
+# exported value (a common Intel-era dotfile leftover), producing flags that
+# point at a prefix containing no libomp. MKL stays off on both arches;
+# macOS builds use Accelerate/OpenBLAS.
 ifeq ($(UNAME_S),Darwin)
-ifeq ($(UNAME_M),arm64)
   CMAKE_FLAGS += -DFAISS_ENABLE_MKL=OFF
-  HOMEBREW_PREFIX ?= /opt/homebrew
-  CMAKE_FLAGS += -DOpenMP_ROOT=$(HOMEBREW_PREFIX)/opt/libomp
-  CMAKE_FLAGS += -DCMAKE_CXX_FLAGS="-Xclang -fopenmp -I$(HOMEBREW_PREFIX)/opt/libomp/include"
-  CMAKE_FLAGS += -DCMAKE_EXE_LINKER_FLAGS="-L$(HOMEBREW_PREFIX)/opt/libomp/lib -lomp"
-  CMAKE_FLAGS += -DCMAKE_SHARED_LINKER_FLAGS="-L$(HOMEBREW_PREFIX)/opt/libomp/lib -lomp"
+
+ifeq ($(origin LIBOMP_PREFIX),undefined)
+  LIBOMP_PREFIX := $(shell brew --prefix libomp 2>/dev/null)
+endif
+
+ifeq ($(LIBOMP_PREFIX),)
+  $(warning libomp not found: install it with `brew install libomp`, or set LIBOMP_PREFIX. FAISS configure will fail without OpenMP.)
+else
+  CMAKE_FLAGS += -DOpenMP_ROOT=$(LIBOMP_PREFIX)
+  CMAKE_FLAGS += -DCMAKE_CXX_FLAGS="-Xclang -fopenmp -I$(LIBOMP_PREFIX)/include"
+  CMAKE_FLAGS += -DCMAKE_EXE_LINKER_FLAGS="-L$(LIBOMP_PREFIX)/lib -lomp"
+  CMAKE_FLAGS += -DCMAKE_SHARED_LINKER_FLAGS="-L$(LIBOMP_PREFIX)/lib -lomp"
 endif
 endif
 

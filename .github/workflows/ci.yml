@@ -30,15 +30,20 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake libopenblas-dev
 
+      # RUNNER_ARCH is part of both keys: a FAISS build is native machine
+      # code, and macos-13 (X64) / macos-14 (ARM64) both report runner.os
+      # "macOS". Keyed on the OS alone they would share — and poison — one
+      # cache entry with wrong-architecture binaries.
       - name: Compute cache keys
         id: key
         env:
           SRC_HASH: ${{ hashFiles('mix.lock', 'c_src/**', 'Makefile') }}
           RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
         run: |
           FAISS_REV=$(sed -n 's/^FAISS_GIT_REV *?= *//p' Makefile | tr -d ' ')
-          echo "value=${RUNNER_OS}-mix-${ELIXIR_VERSION}-${OTP_VERSION}-test-${SRC_HASH}-${FAISS_REV}" >> "$GITHUB_OUTPUT"
-          echo "faiss=${RUNNER_OS}-faiss-${FAISS_REV}" >> "$GITHUB_OUTPUT"
+          echo "value=${RUNNER_OS}-${RUNNER_ARCH}-mix-${ELIXIR_VERSION}-${OTP_VERSION}-test-${SRC_HASH}-${FAISS_REV}" >> "$GITHUB_OUTPUT"
+          echo "faiss=${RUNNER_OS}-${RUNNER_ARCH}-faiss-${FAISS_REV}" >> "$GITHUB_OUTPUT"
 
       # FAISS source build (~10 min) is cached independently of the NIF/deps
       # so c_src/lib changes don't rebuild FAISS
@@ -105,5 +110,66 @@ jobs:
             _build/test
           key: ${{ needs.setup.outputs.cache-key }}
           fail-on-cache-miss: true
+
+      - run: mix test --include slow
+
+  # The jobs above are ubuntu-22.04, i.e. Linux/amd64 only. This matrix
+  # covers the three native targets they miss.
+  #
+  # macOS is the important one: the Makefile has a large darwin-only path
+  # (install_name_tool @rpath/@loader_path rewriting, libomp discovery,
+  # FAISS_ENABLE_MKL=OFF) that no job exercised. macos-14 is Apple Silicon,
+  # macos-13 is Intel — both matter, because the two differ in Homebrew
+  # prefix and in whether Accelerate or OpenBLAS backs BLAS.
+  #
+  # Self-contained rather than folded into the setup -> restore handoff
+  # above: that flow restores with fail-on-cache-miss, so every extra target
+  # would have to be matrixed through all three jobs to save one cache block.
+  test-native:
+    name: Tests (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14, label: macOS arm64 }
+          - { runner: macos-13, label: macOS amd64 }
+          - { runner: ubuntu-22.04-arm, label: Linux arm64 }
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      # cmake ships on the macOS runner images; libomp does not, and
+      # AppleClang has no OpenMP runtime of its own on either arch.
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libomp
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake libopenblas-dev
+
+      - name: Compute FAISS cache key
+        id: key
+        env:
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          FAISS_REV=$(sed -n 's/^FAISS_GIT_REV *?= *//p' Makefile | tr -d ' ')
+          echo "faiss=${RUNNER_OS}-${RUNNER_ARCH}-faiss-${FAISS_REV}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache FAISS build
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/faiss_ex
+          key: ${{ steps.key.outputs.faiss }}
+
+      - run: mix deps.get
+
+      - run: mix compile --warnings-as-errors
 
       - run: mix test --include slow

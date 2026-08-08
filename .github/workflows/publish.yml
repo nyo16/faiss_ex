@@ -31,14 +31,31 @@ jobs:
         with:
           path: ~/.cache/faiss_ex
           key: publish-faiss-${{ hashFiles('Makefile') }}
+          # Must track the key CI writes (ci.yml "Compute cache keys"), which
+          # is now arch-qualified. This runner is Linux/amd64 -> Linux-X64-.
           restore-keys: |
-            Linux-faiss-
+            Linux-X64-faiss-
 
       - name: Set version from tag
         run: |
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
           sed -i "s/@version \".*\"/@version \"${TAG_VERSION}\"/" mix.exs
           grep '@version' mix.exs
+
+      # ---- Release gate -------------------------------------------------
+      # A tag can point at any commit, and CI only runs on pushes/PRs to
+      # master, so without this the tag itself is unverified. FAISS is shared
+      # via ~/.cache/faiss_ex, so the test build only recompiles the NIF.
+      - name: Check formatting
+        run: mix format --check-formatted
+
+      - name: Run tests
+        run: |
+          mix deps.get
+          mix test --include slow
+        env:
+          MIX_ENV: test
+      # -------------------------------------------------------------------
 
       - run: mix deps.get
         env:
@@ -47,6 +64,11 @@ jobs:
       # hex.publish builds docs, which compiles the project (and FAISS from
       # source on a cold cache — ~10 min)
       - run: mix compile
+        env:
+          MIX_ENV: dev
+
+      - name: Validate the package builds
+        run: mix hex.build
         env:
           MIX_ENV: dev
 
