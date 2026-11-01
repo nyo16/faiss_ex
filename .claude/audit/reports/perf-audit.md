@@ -1,71 +1,146 @@
 # Performance Audit — faiss_ex
 
-Date: 2026-07-12
-Scope: `lib/faiss_ex/shared.ex`, `lib/faiss_ex/index.ex`, `lib/faiss_ex/clustering.ex`, `c_src/faiss_ex_nif.c`, `Makefile`/`mix.exs` (flags only)
+Date: 2026-11-01 · Commit: a397362 (v0.3.2, FAISS v1.15.1) · Prior: 2026-07-12 @ 3d0a7e1 (84/100)
+Scope: `lib/faiss_ex/{index,shared,clustering}.ex`, `c_src/faiss_ex_nif.c`, `Makefile`, `bench/faiss_ex_bench.exs`
 
-## Performance health score: 84/100
+Measurements are from throwaway probe scripts run with `mix run` on this host (Apple M-series, 10 cores, 10 dirty CPU schedulers, libomp + Accelerate confirmed via `otool -L priv/lib/libfaiss.dylib`). The full Benchee suite was not run: 18 scenarios × 9 s ≈ 162 s plus data generation is too close to the 3-minute limit.
 
-The native layer is close to optimal (zero-copy binary inspection, per-resource RW locks, correct dirty-scheduler placement); the remaining cost is concentrated in the list-based public API, which forces O(n) term-building and ~4-10x memory blowup on encode/decode at large batch sizes.
+## Score: 48/100
 
----
+Rubric adaptation (non-Phoenix library; the N+1, index, preload, LiveView and SELECT * criteria are N/A and were replaced with the categories below). Each deduction uses the closest original rubric value. A VM-wide throughput bottleneck counts like a GenServer bottleneck (−10). A hot-path inefficiency counts like an N+1 or missing index (−5). Minor issues count like a missing preload or a SELECT * (−3/−2). No criterion goes below 0.
 
-## Findings
+| Criterion | Max | Deductions | Score |
+|---|---|---|---|
+| Redundant passes/copies in hot paths | 30 | none (the `encode_batch` iodata copy is deliberate; it was measured 2.4× faster than the alternative per CLAUDE.md) | 30 |
+| Lock / CPU contention, critical-section size | 20 | −10 OpenMP oversubscription (N2) · −3 whole-batch write lock, no chunking (P6) · −2 centroids alloc+copy under lock (N7) | 5 |
+| Scheduler misuse | 15 | −10 dirty-CPU pool exhaustion by lock waiters (N1) · −5 `nif_new_index` on a normal scheduler (N4) · −2 `nif_get_num_gpus` (P8) = −17 → floored | 0 |
+| Memory amplification | 15 | −5 Binary API gap for Clustering/`compute_residuals` (N5) · −5 one `StandardGpuResources` per GPU index (N6) | 5 |
+| Build optimization defaults | 10 | −5 `FAISS_OPT_LEVEL=avx2/avx512` is a silent no-op (N3, supersedes P9) | 5 |
+| Benchmark coverage of hot paths | 10 | −5 no concurrency scenario (N8) · −2 reconstruct/decode paths missing (N8) | 3 |
+| **Total** | **100** | 30 + 5 + 0 + 5 + 5 + 3 | **48** |
 
-### 1. [HIGH — at scale] List-only API forces full decode of results; no raw-binary passthrough
-- **Where:** `/Users/nmaroulis/Source/faiss_ex/lib/faiss_ex/index.ex:184-196` (`search/3`), `:243-254` (`reconstruct/2`), `:262-274` (`compute_residuals/3`); `/Users/nmaroulis/Source/faiss_ex/lib/faiss_ex/clustering.ex:92-100`
-- **Issue:** The NIF already returns compact f32/s64 binaries, but the public API unconditionally decodes them into lists of lists (`Shared.binary_to_floats/1` + `Enum.chunk_every/2`). Each decoded float is a boxed 8-byte float plus cons cell — roughly 16 bytes/element vs 4 bytes in the binary, so a `search(index, batch_10k, k: 100)` result materializes ~32 MB of heap terms from an 8 MB binary, all on the calling process heap (GC pressure). Same asymmetry on input: users holding vectors as binaries (e.g., from Nx, files, or a previous FAISS call) must convert binary → list → binary.
-- **Impact:** For large `n × k` or large `dim`, decode dominates end-to-end latency and memory; the FAISS search itself is often cheaper than the term-building. This is the single biggest scalability ceiling the library imposes on users.
-- **Suggestion:** Add an opt-in raw path — e.g., `search(index, data, k, output: :binary)` returning `{distances_bin, labels_bin}` and accepting a pre-encoded `{n, binary}` input — leaving the list API as the friendly default. No C changes required.
+The drop from 84 to 48 is not a code regression. Most prior Elixir- and C-level findings are resolved. The new deductions come from three issues that were measured this time and were already present at 3d0a7e1 [INFERENCE: lock/scheduler/build design unchanged since]: N1, N2 and N3.
 
-### 2. [MEDIUM] Result decode does two full passes plus an intermediate list (`decode` then `chunk_every`)
-- **Where:** `/Users/nmaroulis/Source/faiss_ex/lib/faiss_ex/index.ex:189-190`, `:249`, `:269`; `/Users/nmaroulis/Source/faiss_ex/lib/faiss_ex/clustering.ex:95`
-- **Issue:** `binary_to_floats(bin) |> Enum.chunk_every(k)` builds one flat list of n×k elements, then a second pass re-consumes it into row sublists, allocating a second full list structure and discarding the first. A single recursive pass that pattern-matches `k` (or `dim`) elements per iteration (`<<row::binary-size(k*4), rest::binary>>` + per-row comprehension) halves list allocation and passes.
-- **Impact:** ~2x decode allocation/GC on every search/reconstruct/residual/centroid call; noticeable at large n×k, invisible at small ones.
+## Prior findings status
 
-### 3. [MEDIUM] Search result binaries are allocated inside the read-lock critical section
-- **Where:** `/Users/nmaroulis/Source/faiss_ex/c_src/faiss_ex_nif.c:348-377` (`nif_search_index`)
-- **Issue:** `enif_rwlock_rlock` is taken at line 348, but the two `enif_alloc_binary` calls (lines 370-377) depend only on `n` and `k` — not on any index state — and could execute before locking. Also `dim` is immutable after index creation, so the `data_bin.size` validation (lines 350-359) could move out too (Elixir already validated row length against `dim` during encode; alternatively pass `dim` down). For large `n*k` these allocations can page-fault/zero multi-MB buffers while holding the lock.
-- **Impact:** Readers don't block each other, but the lock hold time is extended, delaying pending writers (`add`/`train`) and — because `enif_rwlock` writer-preference then queues subsequent readers — can convoy searches behind a writer on mixed workloads. Cheap fix, pure win.
-- **Same pattern (lower stakes):** `nif_reconstruct_batch` (`:499-511`) and `nif_compute_residuals` (`:560-579`) also allocate result binaries under the read lock.
+| # | Prior finding | Status | Evidence |
+|---|---|---|---|
+| P1 | List-only API, no raw-binary passthrough | **RESOLVED** for Index | `search_binary/3` `index.ex:258-264`, `reconstruct_binary/2` `:321-325`, binary input on `add/train/add_with_ids` `:199-223,272-275` via `encode_vector_data!` `:453-467` (zero-copy, size check only). The Clustering and `compute_residuals` remainder is tracked as N5. |
+| P2 | Decode used two passes (`binary_to_floats` + `chunk_every`) | **RESOLVED** | Single-pass `decode_rows/4` `shared.ex:42-47`; row sub-binaries feed a comprehension and are not retained. Measured cost: 3.6 ms to decode a 1000×100 result vs 102 ms for the search itself. |
+| P3 | Result binaries allocated under the read lock | **RESOLVED** | Allocation now happens before the lock: search `faiss_ex_nif.c:407-416`, reconstruct `:552-560`, residuals `:620-628`. The critical section is the `faiss_*` call only. |
+| P4 | `encode_batch` makes an extra full-payload copy | **WONTFIX (measured)** | `shared.ex:64-66` is unchanged on purpose: CLAUDE.md records the flat-accumulator rewrite as 2.4× slower. No deduction. |
+| P5 | Property getters on dirty CPU schedulers | **STILL OPEN**, now worse than first thought | `faiss_ex_nif.c:1040-1041`. Prior impact was "µs per call"; the real impact is N1 (getters waiting on a lock hold dirty CPU threads). |
+| P6 | Bulk `add`/`train` holds the write lock for the whole batch, no chunking | **STILL OPEN** | `faiss_ex_nif.c:304-307,462-465`; `index.ex:199-202` has no `chunk_size:`. README `:454` documents only serialization, not search stalls. |
+| P7 | `reconstruct/2` walked `keys` twice | **RESOLVED** | `index.ex:304` uses single-pass `Shared.encode_ids!/1` (`shared.ex:16-22`). |
+| P8 | `nif_get_num_gpus` on a normal scheduler (CUDA init can take tens of ms) | **STILL OPEN** | `faiss_ex_nif.c:1045` flag `0`; the GPU implementation is at `:811-815`. |
+| P9 | Default `FAISS_OPT_LEVEL=generic` leaves AVX2 unused | **STILL OPEN, and the override does not work** | See N3. The documented override builds the wrong CMake target. |
 
-### 4. [MEDIUM] Batch encode builds per-row binaries, reverses, then copies again via `IO.iodata_to_binary`
-- **Where:** `/Users/nmaroulis/Source/faiss_ex/lib/faiss_ex/shared.ex:39-45` (`encode_batch/4`), `:51-63` (`encode_row/5`)
-- **Issue:** Each row is appended element-by-element into its own binary (the append is BEAM-optimized, fine), but rows are then collected into a list, `Enum.reverse`d, and concatenated with `IO.iodata_to_binary/1` — one extra full copy of the entire payload plus a transient list of n refc binaries. Appending rows directly into a single accumulator binary (the same writable-binary optimization already used inside `encode_row`) eliminates the row list, the reverse, and the final copy — one pass, one buffer.
-- **Impact:** ~1 extra full-payload copy + n binary headers per `add`/`train`/`search` batch call. For a 1M × 128 f32 add (512 MB payload) that is a spare 512 MB copy.
+## New findings
 
-### 5. [LOW] Property getters run on dirty CPU schedulers, paying migration cost per call
-- **Where:** `/Users/nmaroulis/Source/faiss_ex/c_src/faiss_ex_nif.c:988-990` (`nif_get_index_dim/ntotal/is_trained` flagged `ERL_NIF_DIRTY_JOB_CPU_BOUND`)
-- **Issue:** The dirty placement is deliberate and correct (they block on the rwlock, and a writer may hold it for seconds during `train`), but it means every `ntotal/1` call pays the ~1-3 µs dirty-scheduler round trip for a nanosecond read. An `enif_rwlock_tryrlock` fast path is not available for these as NIFs can't reschedule themselves to dirty conditionally without `enif_schedule_nif`; that (try-rlock on a normal scheduler, `enif_schedule_nif` to dirty on contention) would make the common uncontended case ~free.
-- **Impact:** Only matters if callers poll `ntotal` in hot loops; correctness-first trade-off, acceptable as-is.
+### N1 — High — Requests waiting on one index's lock can fill the dirty-CPU pool and stall every other index
+- **Where:** all lock-taking NIFs are `ERL_NIF_DIRTY_JOB_CPU_BOUND` (`c_src/faiss_ex_nif.c:1029-1036,1040-1041,1048-1049`). They block in `enif_rwlock_rlock`/`rwlock` (e.g. `:416`, `:560`, `:717`, `:730`) while holding a dirty CPU scheduler thread. The doc claim at `index.ex:78-79` covers normal schedulers only.
+- **Evidence (measured):** `train/2` on `IVF2048,Flat` (100k×64, 3.9 s) takes A's write lock. Then 10 tasks call `Index.ntotal(A)`, one per dirty CPU scheduler.
+  - A one-query `search_binary` on a **different** index B then took **3643.8 ms**.
+  - The baseline is 1.7 ms. The control (train running, no waiters) is **0.1 ms**.
+  - So the stall is caused by the pool queue, not by CPU load. The same thing happens with searches against an index that is being trained or bulk-added.
+  - The VM's own dirty-CPU work (e.g. large-heap GC) shares the same pool [INFERENCE].
+- **Fix:**
+  1. Move the pure getters (`ntotal`, `is_trained`) to `ERL_NIF_DIRTY_JOB_IO_BOUND`. They compute nothing, and the IO pool exists for blocking waits.
+  2. For heavy reads (search, reconstruct, residuals), try `enif_rwlock_tryrlock` first on the CPU-bound entry. If it fails, `enif_schedule_nif` an IO-bound variant that blocks on the lock and does the whole operation there. Do not hold a pthread rwlock across a reschedule: an unlock from a different thread is UB.
+  3. Update the Concurrency section in CLAUDE.md and the moduledoc.
 
-### 6. [LOW] Bulk `add` holds the write lock for the entire batch, starving searches
-- **Where:** `/Users/nmaroulis/Source/faiss_ex/c_src/faiss_ex_nif.c:251-265` (`nif_add_to_index`); Elixir entry `/Users/nmaroulis/Source/faiss_ex/lib/faiss_ex/index.ex:146-153`
-- **Issue:** A single `add/2` with a very large batch (or `train/2`) holds the write lock for the full FAISS call, blocking all concurrent searches on that index for its duration. This is inherent to the (correct) locking model, but the Elixir layer offers no chunking, so users doing live ingest + serve on one index get multi-second search stalls.
-- **Impact:** Latency spikes on mixed read/write workloads with large batches. Mitigation is documentation plus an optional `chunk_size:` option on `add/2` that splits the NIF calls, letting searches interleave between chunks.
+### N2 — High — FAISS's OpenMP teams multiply across dirty schedulers (≈3× throughput loss under concurrency)
+- **Where:**
+  - The NIF never limits OpenMP threads. There is no `omp_set_num_threads` call anywhere in `c_src/faiss_ex_nif.c`, and the FAISS C API offers no equivalent (grep of `c_api/` for `omp_|num_threads`: none).
+  - FAISS opens an `omp parallel num_threads(nt)` team even for a single query (`faiss/utils/distances.cpp:301,342,652`).
+  - Each of the 10 dirty CPU schedulers can therefore start a ~10-thread team, so up to ~100 runnable threads compete for 10 cores.
+- **Evidence (measured):** Flat index, 100k×128, `search_binary` with k=10, two runs each:
 
-### 7. [LOW] `reconstruct/2` traverses `keys` twice (`length/1` then encode)
-- **Where:** `/Users/nmaroulis/Source/faiss_ex/lib/faiss_ex/index.ex:244-245`
-- **Issue:** `length(keys)` is one full pass; `Shared.int64s_to_binary(keys)` is a second. A combined count-and-encode (as `encode_vectors!/2` already does for vectors) does it in one. Same micro-pattern applies to `add_with_ids/3` ids (`:166`), where ids length is never counted in Elixir at all (fine — C validates), so only `reconstruct` double-passes.
-- **Impact:** Negligible except for very long key lists; trivial fix.
+  | Scenario | Default OpenMP | `OMP_NUM_THREADS=1` |
+  |---|---|---|
+  | 10 processes × 200 single-query searches | 1845 / 1634 ms | 622 / 572 ms (~3× faster) |
+  | Serial single-query latency (200 calls) | 225 ms | 215 ms (OpenMP adds nothing here) |
+  | One 1000-query batch | 102 ms | 164 ms (OpenMP helps here) |
 
-### 8. [LOW, GPU builds only] `nif_get_num_gpus` runs on a normal scheduler but may initialize the CUDA driver
-- **Where:** `/Users/nmaroulis/Source/faiss_ex/c_src/faiss_ex_nif.c:773-777`, scheduled at `:994` with flag `0`
-- **Issue:** `faiss_get_num_gpus()` calls `cudaGetDeviceCount`, whose first invocation in a process loads/initializes the CUDA driver and can take tens of milliseconds — well over the 1 ms normal-scheduler budget.
-- **Impact:** One-time normal-scheduler stall on first call in CUDA builds. Flag it `ERL_NIF_DIRTY_JOB_IO_BOUND`.
+  - libomp's default 200 ms spin-wait after a parallel region (`KMP_BLOCKTIME`) likely adds to the loss [INFERENCE].
+  - On Linux, FAISS links whatever `libopenblas.so` resolves to (`faiss/CMakeLists.txt:751-762`). On Ubuntu that is usually the pthreads OpenBLAS, which nests its own thread pool inside OpenMP [INFERENCE].
+- **Fix:**
+  1. Add a per-call `:threads` option (or an app-env default). The NIF calls `omp_set_num_threads(n)` on the dirty thread before the `faiss_*` call; that setting is per-thread, so concurrent callers do not interfere. Link the NIF against libomp/libgomp.
+  2. Document the trade-off in README "Concurrency": many concurrent small queries → `OMP_NUM_THREADS=1` (with `KMP_BLOCKTIME=0` / `OMP_WAIT_POLICY=passive`); few large batches → default.
+  3. Recommend `libopenblas-openmp-dev` in the Linux setup.
 
-### 9. [LOW] Default `FAISS_OPT_LEVEL=generic` leaves x86 SIMD performance unused
-- **Where:** `/Users/nmaroulis/Source/faiss_ex/Makefile:13`; `/Users/nmaroulis/Source/faiss_ex/mix.exs:69`
-- **Issue:** The default builds FAISS without `avx2`/`avx512` dispatch. On x86-64 hosts, `avx2` typically yields 2-4x on flat/PQ distance computations. The env override exists (good, deliberate portability default), but nothing auto-detects the host or surfaces the knob at build time, so most users silently run the slow kernels.
-- **Impact:** Up to several-x search/train throughput on x86; no effect on Apple Silicon. Consider auto-detecting (`sysctl`/`/proc/cpuinfo`) with `generic` fallback, or at least printing a build-time hint.
+### N3 — High — `FAISS_OPT_LEVEL=avx2|avx512` has no effect: the Makefile builds and ships the generic `faiss` target
+- **Where:** `Makefile:183` (`$(MAKE) ... faiss`), `:188` (`faiss_c`), `:191` and `:200` (copy `faiss/libfaiss` and `c_api/libfaiss_c`). README `:130-145` documents `FAISS_OPT_LEVEL=avx2 mix compile` as the way to get AVX2.
+- **Evidence:**
+  - In FAISS v1.15.1 the AVX2/AVX-512 code goes into **separate** targets: `faiss_avx2`, `faiss_avx512` and `faiss_avx512_spr`, with `-mavx2 -mfma ...` set only on them (`faiss/CMakeLists.txt:454-495`). The C API equivalents are `faiss_c_avx2` and friends (`c_api/CMakeLists.txt:44-83`).
+  - The main `faiss` target (`faiss/CMakeLists.txt:452`) gets SIMD flags only when `FAISS_OPT_LEVEL=dd` (`:545-602`).
+  - Result: an x86-64 build with `avx2` still ships the scalar/SSE `libfaiss`. Linux x86 is the usual production target and the CI target (`.github/workflows/ci.yml`, ubuntu).
+  - arm64 is not affected: NEON is always compiled into `faiss` (`:629-632`).
+  - A changed `FAISS_OPT_LEVEL` also never reconfigures an existing build: `$(FAISS_BUILD)/Makefile` depends only on `.cloned` (`Makefile:176`). README `:144`'s `rm -rf` works around this.
+- **Fix:**
+  - Preferred: default `FAISS_OPT_LEVEL` to `dd` (runtime SIMD dispatch into the main `faiss`/`faiss_c` targets). One portable binary then uses AVX2/AVX-512 when the CPU has it, and the target-name problem goes away. Change both `Makefile:24` and `mix.exs:80`.
+  - If you keep explicit levels: build `faiss_$(LEVEL)` + `faiss_c_$(LEVEL)`, copy them as `libfaiss`/`libfaiss_c`, and fix the `install_name_tool`/soname handling.
+  - Either way: put the opt level in the build-dir path (e.g. `build-$(FAISS_OPT_LEVEL)`) so changing it triggers a reconfigure, and update README `:130-147`.
 
----
+### N4 — Medium — `nif_new_index` runs `faiss_index_factory` on a normal scheduler; it measures 4–176 ms
+- **Where:** `c_src/faiss_ex_nif.c:1028` (flag `0`), with the factory call at `:237`.
+- **Evidence (measured `Index.new/2`):**
 
-## Clean areas (one line each)
+  | Factory string | Time |
+  |---|---|
+  | `IVF262144,Flat` (d=128) | 4.3 ms |
+  | `IVF1048576,PQ16` (d=128) | 16.4 ms |
+  | `LSHr` (d=512) | 21.0 ms |
+  | `LSHr` (d=2048) | **175.7 ms** |
+  | `HNSW32` | 0.28 ms |
 
-- C binary handling: inputs via `enif_inspect_binary` (zero-copy) and outputs via `enif_alloc_binary`/`enif_make_binary` (no double copy; the one `memcpy` in centroids is unavoidable since FAISS owns that buffer).
-- Locking: per-resource `ErlNifRWLock`, reads share, writes exclusive, two-lock ordering in `nif_train_clustering` fixed and documented — no global lock, no ordering hazard.
-- Dirty scheduler assignments for the heavy ops (CPU-bound vs IO-bound split) are correct; only items 5 and 8 above are debatable.
-- `nif_reconstruct_batch` contiguous-key fast path (batched `reconstruct_n`) is a genuine optimization and the O(n) contiguity scan runs outside the lock.
-- Decode helpers use binary comprehensions (not `:binary.bin_to_list`) — the efficient construct.
-- Per-call Elixir overhead is otherwise minimal: single-pass `encode_vectors!` with inline dim validation, no re-validation, no re-encoding, batch and single-vector share one path.
-- NIF compiled `-O2 -fPIC`; FAISS built `CMAKE_BUILD_TYPE=Release` — no missing optimization flags (aside from item 9's opt-level default).
+  - The LSH rotation is built in the constructor: `IndexLSH.cpp:37-38`, `rrot.init(5)`.
+  - All of these exceed the 1 ms budget for normal schedulers, and the factory string is caller-controlled.
+  - The moduledoc promise "heavy operations run on dirty schedulers" (`index.ex:78-79`) is therefore broken for `new/3`.
+- **Fix:** flag `nif_new_index` as `ERL_NIF_DIRTY_JOB_CPU_BOUND`. Index creation is rare, so the ~µs dirty hop costs nothing. Update the CLAUDE.md dirty-scheduler list. `nif_new_clustering` (`:1047`) is just a constructor and can stay on a normal scheduler.
+
+### N5 — Medium — The Binary API stops at `Index`: Clustering and `compute_residuals` only accept lists in and return lists out
+- **Where:**
+  - `clustering.ex:73` (`train/2` guards `is_list(data)`), `:88-91` (`get_centroids/1` always decodes), `:108-110` (`get_cluster_assignment/2` list-only).
+  - `index.ex:336-349` (`compute_residuals/3`: `is_list` guards, always decodes).
+  - Moduledoc `index.ex:41` claims "Every hot-path function also works directly with raw binaries".
+- **Evidence:**
+  - k-means training is the biggest input in the library. A caller holding a binary (Nx, file, HTTP) must build a list of lists (~32 B per float on the heap) only for `encode_vectors!/2` to turn it straight back into a binary.
+  - On the output side, the measured decode amplification is 8× for f32 rows (boxed float + cons cell per element). For a 1000×100 result: 1.2 MB of binaries became 4.83 MB of terms (`:erts_debug.flat_size`).
+- **Fix:**
+  - Route `Clustering.train/2` through the same `encode_vector_data!` binary clause as `Index.train/2` (move that helper to `Shared`).
+  - Add `get_centroids_binary/1` (the NIF already returns `{k, d, bin}`), and let `get_cluster_assignment/2` accept a binary by delegating to `Index.search_binary/3`.
+  - Either accept binary `xs`/`keys` in `compute_residuals/3` or add `compute_residuals_binary/3`.
+  - Fix the moduledoc claim.
+
+### N6 — Medium (CUDA builds only) — Every `cpu_to_gpu` creates its own `StandardGpuResources`, reserving up to 1.5 GiB of GPU temp memory per index
+- **Where:** `c_src/faiss_ex_nif.c:751-752` (`faiss_StandardGpuResources_new` on every call). The resource is owned per index at `:766-775`.
+- **Evidence:**
+  - Each resource reserves temp memory per device on first use: up to 512 MiB / 1 GiB / **1.5 GiB** depending on GPU size (`faiss/gpu/StandardGpuResources.cpp:51-58,180-202,452-455`).
+  - It also creates its own cuBLAS handle and streams [INFERENCE: FAISS GPU design].
+  - N GPU indexes therefore reserve N× that memory. FAISS recommends sharing one resource object across indexes.
+- **Fix:**
+  - Create one `GpuResourcesResource` per device: lazily in a NIF-global table guarded by a mutex, or as an explicit `FaissEx.GpuResources.new/0` passed to `cpu_to_gpu/3`.
+  - Keep the per-index `gpu_resources_ref` as a refcount holder.
+  - Optionally expose `faiss_StandardGpuResources_setTempMemory` (C API `StandardGpuResources_c.h:36`).
+
+### N7 — Low — `nif_get_clustering_centroids` allocates and copies the result while holding the read lock
+- **Where:** `c_src/faiss_ex_nif.c:948-970`. `enif_alloc_binary` at `:962` and `memcpy` at `:967` both run under the read lock.
+- **Evidence:** the allocation size is `k*d`. Both values are constructor arguments that FAISS never changes, so they could be cached at wrap time, the same way `IndexResource.dim` is (`:66-70`). The copy itself has to stay inside the lock because FAISS owns the buffer. The cost is small (k×d floats), but it is the only remaining allocation inside a critical section.
+- **Fix:** cache `k`/`d` in `ClusteringResource` and call `enif_alloc_binary(k*d*4)` before the lock. That also lets `nif_train_clustering` (`:910-918`) validate size before taking both write locks, so its `goto unlock` validation branches disappear.
+
+### N8 — Medium/Low — The benchmarks do not exercise the paths where the cost actually is
+- **Where:** `bench/faiss_ex_bench.exs:41-112`.
+- **Evidence:**
+  - Every scenario is single-process. N1 and N2, which show 3× and >1000× effects, cannot appear in it.
+  - `reconstruct` only uses contiguous keys (`:24-26`), so the per-key loop (`faiss_ex_nif.c:563-567`) is never measured.
+  - There is no `reconstruct_binary` scenario and no list-vs-binary decode comparison at large k (`k = 10` only, `:7`).
+  - Only `Flat` is tested; there is no IVF/HNSW search.
+  - The `add` scenarios include `Index.new` in the timed function (`:45,50,56,60`).
+- **Fix:**
+  - Add a `parallel: System.schedulers_online()` Benchee run (or a Task-fanout scenario) for small searches.
+  - Add scenarios for shuffled-key reconstruct and `reconstruct_binary`, and for k=100 with list vs `search_binary`.
+  - Add one IVF/HNSW index.
+  - Move index creation into `before_each`.
+
+Clean areas: the C side uses zero-copy `enif_inspect_binary` inputs and `enif_alloc_binary`/`enif_make_binary` outputs with no extra copies; validation and allocation happen before the lock in every single-lock NIF; there is no O(n²) pattern; the decoders produce no sub-binary retention; and the NIF is built with `-O2`, FAISS with `Release`. macOS uses Accelerate + Homebrew libomp, as intended.

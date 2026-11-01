@@ -72,7 +72,7 @@ Add `faiss_ex` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:faiss_ex, "~> 0.3.0"}
+    {:faiss_ex, "~> 0.4.0"}
   ]
 end
 ```

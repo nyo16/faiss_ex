@@ -29,6 +29,10 @@ mix format           # Format code
 - `FAISS_OPT_LEVEL` accepts only `dd` (default, runtime SIMD dispatch) and `generic`; FAISS's `avx2`/`avx512`/`sve` levels build differently named libs (`libfaiss_c_avx2` links `libfaiss_avx2`) and are rejected with `$(error)`
 - The Makefile must stay GNU Make 3.81-compatible (macOS ships 3.81): no `$(file ...)`, no `.ONESHELL`
 - `FAISS_PREFIX` env var: when set, uses system-installed FAISS instead of building from source
+- The pinned commit is re-checked on every `make` by the phony `verify-faiss` target (order-only prerequisite of the configure step and the NIF), so a tampered warm cache fails closed. `FAISS_GIT_REV`/`FAISS_GIT_REPO` are allow-listed with pure-make `strip_chars` (never pass them through `$(shell)` unvalidated); recipe paths are quoted
+- CMake ≥ 3.24 and (with `USE_CUDA=true`) nvcc ≥ 12 are checked inside the configure recipe
+- The macOS dev box has no CUDA: code inside `#ifdef FAISS_GPU_ENABLED` is compiled only by CI's `cuda-syntax` job (`nvidia/cuda:12.6.3-devel-ubuntu24.04`, `-fsyntax-only -Werror`). Reproduce locally with `docker run` on that image (see `.github/workflows/ci.yml`)
+- `pull_request` CI has no base-branch filter so stacked PRs get checks; job names are not required checks (ruleset disabled), so renaming jobs is safe
 
 ## Architecture
 
@@ -47,6 +51,8 @@ Elixir (FaissEx.Index / FaissEx.Clustering)
 - `c_src/faiss_ex_nif.c` — Single C file with all NIF implementations. Uses NIF resource types with destructors for index/clustering/GPU resource lifecycle.
 
 **No FAISS call may throw inside an OpenMP region (C layer):** an exception cannot cross an OpenMP parallel region (even one serialized by an `if` clause) to the C API's try/catch — the runtime calls `std::terminate` and the whole VM aborts. `Index::compute_residual_n` and the base `Index::reconstruct_n` call `reconstruct` inside such regions, so the NIF never calls `faiss_Index_compute_residual_n` (it loops `faiss_Index_compute_residual`) and uses `faiss_Index_reconstruct_n` only for Flat/IVF (`has_safe_reconstruct_n`, whose overrides range-check up front) after an under-lock `ntotal` check; everything else reconstructs per key. Regression tests: `index_test.exs` "reconstruction errors never abort the VM". Before calling any other batched FAISS entry point, check its implementation for `#pragma omp` around throwing code.
+
+**Batched reconstruct may skip rows (C layer):** `IndexIVF::reconstruct_n` writes only rows whose *id* lies in the key range, so with sparse `add_with_ids` ids some rows stay unwritten. The NIF tags every row with `UNWRITTEN_ROW_TAG` (a signaling-NaN bit pattern) before the batched call and returns `{:error, "key out of range"}` if any row is still tagged — never return an `enif_alloc_binary` buffer FAISS may not have fully written.
 
 **NIF resource types:** `FaissIndex`, `FaissClustering`, `FaissGpuResources` (when `FAISS_GPU_ENABLED`). BEAM GC handles cleanup via destructors.
 
