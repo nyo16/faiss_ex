@@ -9,9 +9,9 @@ defmodule FaissEx.OmpThreadsTest do
   end
 
   test "rejects negative and non-integer thread counts" do
-    assert_raise FunctionClauseError, fn -> FaissEx.set_omp_threads(-1) end
-    assert_raise FunctionClauseError, fn -> FaissEx.set_omp_threads(2.0) end
-    assert_raise FunctionClauseError, fn -> FaissEx.set_omp_threads(:all) end
+    for bad <- [-1, 2.0, :all] do
+      assert_raise FunctionClauseError, fn -> FaissEx.set_omp_threads(bad) end
+    end
   end
 
   test "search results do not depend on the thread count" do

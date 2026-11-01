@@ -18,6 +18,22 @@ defmodule FaissEx.Clustering do
       {:ok, %{labels: labels}} =
         FaissEx.Clustering.get_cluster_assignment(trained, [hd(data)])
       # labels: [[cluster_id]]
+
+  ## Value semantics
+
+  A clustering struct is a value: `train/2` never changes the struct you
+  pass in. Each call builds a fresh FAISS clustering object and a fresh
+  quantizer and returns them in a new struct, so an untrained struct can be
+  trained several times (different data, concurrently from different
+  processes) and every returned struct stays self-consistent — its
+  centroids and its quantizer always come from the same training run.
+
+  ## Binary input and output
+
+  `train/2` and `get_cluster_assignment/2` also accept a row-major
+  `f32-native` binary (`d` floats per vector), and `get_centroids_binary/1`
+  returns the centroids as one such binary — see the *Binary API* section of
+  `FaissEx.Index`.
   """
 
   alias FaissEx.Index
@@ -63,50 +79,75 @@ defmodule FaissEx.Clustering do
   end
 
   @doc """
-  Trains the clustering on the given data.
+  Trains k-means on `data` and returns a new, trained clustering.
 
-  Creates a flat index internally for the quantizer; after training it holds
-  the `k` centroids. `data` must be a list of lists of floats with inner
-  dimension `d`.
+  `data` is a list of vectors with `d` elements each, or a row-major
+  `f32-native` binary. The input struct is not modified (see *Value
+  semantics* in the moduledoc): the result carries its own clustering
+  object and a Flat quantizer index holding the `k` centroids.
+
+  Returns `{:error, "n must be positive"}` for empty data without
+  allocating anything, and `{:error, reason}` from FAISS when training
+  fails (for example, fewer points than clusters).
   """
-  @spec train(t(), [[number()]]) :: {:ok, t()} | error()
-  def train(%__MODULE__{ref: ref, d: d} = clustering, data) when is_list(data) do
-    {n, data_bin} = Shared.encode_vectors!(data, d)
+  @spec train(t(), Index.vector_data()) :: {:ok, t()} | error()
+  def train(%__MODULE__{d: d, k: k} = clustering, data) when is_list(data) or is_binary(data) do
+    case Shared.encode_vector_data!(data, d) do
+      {0, _} ->
+        {:error, "n must be positive"}
 
-    # On training failure the discarded quantizer is not leaked — its NIF
-    # resource is freed by the BEAM GC via the resource destructor.
-    with {:ok, quantizer} <- Index.new(d, "Flat"),
-         :ok <- NIF.nif_train_clustering(ref, n, data_bin, quantizer.ref) do
-      {:ok, %__MODULE__{clustering | index: quantizer, trained?: true}}
+      {n, data_bin} ->
+        # On failure the fresh clustering object and quantizer are dropped
+        # and freed by the BEAM GC via their resource destructors.
+        with {:ok, ref} <- NIF.nif_new_clustering(d, k),
+             {:ok, quantizer} <- Index.new(d, "Flat"),
+             :ok <- NIF.nif_train_clustering(ref, n, data_bin, quantizer.ref) do
+          {:ok, %__MODULE__{clustering | ref: ref, index: quantizer, trained?: true}}
+        end
     end
   end
 
   @doc """
   Returns the cluster centroids as a list of lists `[[float]]` with shape `{k, d}`.
+
+  Returns `{:error, "no centroids available"}` for a clustering that has
+  not been trained.
   """
   @spec get_centroids(t()) :: {:ok, [[float()]]} | error()
-  def get_centroids(%__MODULE__{ref: ref, d: d}) do
-    with {:ok, {_k, _d, centroids_bin}} <- NIF.nif_get_clustering_centroids(ref) do
+  def get_centroids(%__MODULE__{d: d} = clustering) do
+    with {:ok, centroids_bin} <- get_centroids_binary(clustering) do
       {:ok, Shared.binary_to_float_rows(centroids_bin, d)}
+    end
+  end
+
+  @doc """
+  Returns the cluster centroids as one raw binary — the zero-decode
+  counterpart of `get_centroids/1`: `k * d` `f32-native` floats, row-major.
+  """
+  @spec get_centroids_binary(t()) :: {:ok, binary()} | error()
+  def get_centroids_binary(%__MODULE__{ref: ref}) do
+    with {:ok, {_k, _d, centroids_bin}} <- NIF.nif_get_clustering_centroids(ref) do
+      {:ok, centroids_bin}
     end
   end
 
   @doc """
   Assigns vectors to their nearest cluster.
 
+  `data` accepts the same list or binary forms as `FaissEx.Index.search/3`.
   Searches the quantizer index populated during `train/2` — the trained
   centroids are already indexed, so no per-call rebuild is needed.
 
   Returns `{:ok, %{labels: [[integer]], distances: [[float]]}}`.
   """
-  @spec get_cluster_assignment(t(), Index.vectors()) ::
+  @spec get_cluster_assignment(t(), Index.vector_data()) ::
           {:ok, %{distances: [[float()]], labels: [[integer()]]}} | error()
   def get_cluster_assignment(%__MODULE__{index: nil}, _data) do
     {:error, "clustering not trained"}
   end
 
   def get_cluster_assignment(%__MODULE__{index: %Index{} = quantizer}, data)
-      when is_list(data) do
+      when is_list(data) or is_binary(data) do
     Index.search(quantizer, data, 1)
   end
 end

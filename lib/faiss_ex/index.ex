@@ -3,7 +3,8 @@ defmodule FaissEx.Index do
   Create, populate, search, and manage FAISS indexes.
 
   An index holds a collection of vectors and supports nearest-neighbor search.
-  Vectors are passed as flat lists (single vector) or lists of lists (batch).
+  Vectors are passed as flat lists (single vector), lists of lists (batch),
+  or row-major `f32-native` binaries (see *Binary API* below).
 
   ## Creating and searching
 
@@ -51,11 +52,17 @@ defmodule FaissEx.Index do
   the number of vectors is inferred from `byte_size(binary)`. IDs and keys
   are 64-bit native-endian signed integers (`s64-native`).
 
-    * Binary input — `add/2`, `train/2`, and `add_with_ids/3` accept a
-      binary anywhere they accept lists (mixing forms is fine).
-    * Binary output — `search_binary/3` and `reconstruct_binary/2` return
-      raw result binaries instead of decoded lists. The list-returning
-      functions never change shape based on input type.
+    * Binary input — `add/2`, `add_with_ids/3`, `train/2`, `search/3`,
+      `compute_residuals/3`, `reconstruct_binary/2` (keys), and
+      `FaissEx.Clustering.train/2` / `FaissEx.Clustering.get_cluster_assignment/2`
+      accept a binary anywhere they accept lists (mixing forms is fine).
+    * Binary output — `search_binary/3`, `reconstruct_binary/2`,
+      `compute_residuals_binary/3`, and `FaissEx.Clustering.get_centroids_binary/1`
+      return raw result binaries instead of decoded lists. The
+      list-returning functions never change shape based on input type.
+
+  A binary may be a sub-binary at any byte offset (`binary_part/3`, a
+  pattern-match tail); the NIF copies it to an aligned buffer if needed.
 
   Decode result binaries with a comprehension when needed:
 
@@ -134,20 +141,26 @@ defmodule FaissEx.Index do
   ## Options
 
     * `:metric` - distance metric, `:l2` (default) or `:inner_product`
-    * `:device` - `:host` (default) or `{:cuda, device_id}`
+    * `:device` - `:host` (default) or `{:cuda, device_id}` with a
+      non-negative integer `device_id`
+
+  Unknown options raise `ArgumentError`.
 
   ## Errors
 
-  The two failure modes are deliberately different shapes. An unknown
-  `:metric` raises `ArgumentError`, because the set of valid metrics is
-  fixed by this library and a wrong one cannot be handled at runtime. A
-  `dim` or `description` that FAISS rejects returns `{:error, reason}`,
-  because those routinely come from configuration or user input.
+  Caller mistakes that this library can detect — an unknown option,
+  `:metric`, or `:device` — raise `ArgumentError`. A `dim` or `description`
+  that FAISS rejects returns `{:error, reason}`, because those routinely
+  come from configuration.
 
-  This split is not uniform across the module: `add_with_ids/3` returns
-  `{:error, "binary size mismatch"}` for an id/vector count mismatch, while
-  `compute_residuals/3` raises for the same mistake. Check each function's
-  own docs.
+  ## Factory descriptions are trusted input
+
+  `description` is parsed by FAISS's index factory and decides how much
+  memory the index allocates — an `"IVF1048576,Flat"` or `"IVF4M_HNSW32"`
+  quantizer can reserve gigabytes before any vector is added. Treat it like
+  code, not data: if it is derived from user input, map the input onto an
+  allow-list of descriptions you have sized. Descriptions longer than 256
+  bytes return `{:error, "description too long"}`.
 
   ## Examples
 
@@ -157,14 +170,13 @@ defmodule FaissEx.Index do
   """
   @spec new(pos_integer(), String.t(), keyword()) :: {:ok, t()} | error()
   def new(dim, description, opts \\ []) do
-    metric = Keyword.get(opts, :metric, :l2)
-    device = Keyword.get(opts, :device, :host)
+    opts = Keyword.validate!(opts, metric: :l2, device: :host)
 
     # Values mirror FaissMetricType in FAISS's c_api/Index_c.h; the C side
     # static-asserts them, so a FAISS bump that renumbers the enum fails to
     # compile instead of silently searching the wrong metric.
     metric_int =
-      case metric do
+      case opts[:metric] do
         :l2 ->
           1
 
@@ -175,6 +187,8 @@ defmodule FaissEx.Index do
           raise ArgumentError,
                 "invalid metric #{inspect(other)}, expected :l2 or :inner_product"
       end
+
+    device = validate_device!(opts[:device])
 
     with {:ok, ref} <- NIF.nif_new_index(dim, description, metric_int) do
       index = %__MODULE__{
@@ -189,6 +203,16 @@ defmodule FaissEx.Index do
         {:cuda, device_id} -> cpu_to_gpu(index, device_id)
       end
     end
+  end
+
+  defp validate_device!(:host), do: :host
+
+  defp validate_device!({:cuda, id} = device) when is_integer(id) and id >= 0, do: device
+
+  defp validate_device!(other) do
+    raise ArgumentError,
+          "invalid device #{inspect(other)}, expected :host or {:cuda, device_id} " <>
+            "with a non-negative integer device_id"
   end
 
   @doc """
@@ -208,7 +232,7 @@ defmodule FaissEx.Index do
   """
   @spec add(t(), vector_data()) :: :ok | error()
   def add(%__MODULE__{ref: ref, dim: dim}, data) when is_list(data) or is_binary(data) do
-    {n, bin} = encode_vector_data!(data, dim)
+    {n, bin} = Shared.encode_vector_data!(data, dim)
     NIF.nif_add_to_index(ref, n, bin)
   end
 
@@ -216,9 +240,10 @@ defmodule FaissEx.Index do
   Adds vectors with explicit IDs.
 
   Vectors and IDs each accept lists or raw binaries (`f32-native` vectors,
-  `s64-native` IDs), in any combination. Returns
-  `{:error, "binary size mismatch"}` when the ID count does not match the
-  vector count.
+  `s64-native` IDs), in any combination. Raises `ArgumentError` when the
+  ID count does not match the vector count. Indexes that do not support
+  explicit IDs (a plain `"Flat"`; wrap it as `"IDMap,Flat"`) return
+  `{:error, reason}`.
 
   ## Examples
 
@@ -228,23 +253,34 @@ defmodule FaissEx.Index do
   @spec add_with_ids(t(), vector_data(), id_data()) :: :ok | error()
   def add_with_ids(%__MODULE__{ref: ref, dim: dim}, data, ids)
       when (is_list(data) or is_binary(data)) and (is_list(ids) or is_binary(ids)) do
-    {n, data_bin} = encode_vector_data!(data, dim)
-    {_n_ids, ids_bin} = encode_id_data!(ids)
+    {n, data_bin} = Shared.encode_vector_data!(data, dim)
+    {n_ids, ids_bin} = Shared.encode_id_data!(ids)
+
+    if n_ids != n do
+      raise ArgumentError, "got #{n_ids} ids for #{n} vectors, expected one id per vector"
+    end
+
     NIF.nif_add_with_ids_to_index(ref, n, data_bin, ids_bin)
   end
 
   @doc """
   Searches the index for the `k` nearest neighbors.
 
-  Returns `{:ok, %{distances: [[float]], labels: [[integer]]}}`.
+  Queries accept the same list or binary forms as `add/2`. Returns
+  `{:ok, %{distances: [[float]], labels: [[integer]]}}` — one row of `k`
+  results per query — whatever the input form.
 
   When `k` exceeds the number of indexed vectors, FAISS pads the missing
   positions with label `-1` (and an implementation-defined distance).
+
+  `k` sizes the result: the NIF allocates `n * k * 12` bytes (an `f32`
+  distance and an `s64` label per result) before searching. Cap `k` when it
+  comes from a caller. `k` must be a positive integer.
   """
-  @spec search(t(), vectors(), pos_integer()) ::
+  @spec search(t(), vector_data(), pos_integer()) ::
           {:ok, %{distances: [[float()]], labels: [[integer()]]}} | error()
-  def search(%__MODULE__{ref: ref, dim: dim}, data, k) when is_list(data) do
-    {n, data_bin} = Shared.encode_vectors!(data, dim)
+  def search(%__MODULE__{ref: ref, dim: dim}, data, k) when is_list(data) or is_binary(data) do
+    {n, data_bin} = Shared.encode_vector_data!(data, dim)
 
     with {:ok, {distances_bin, labels_bin}} <- NIF.nif_search_index(ref, n, data_bin, k) do
       distances = Shared.binary_to_float_rows(distances_bin, k)
@@ -262,12 +298,13 @@ defmodule FaissEx.Index do
   `{:ok, %{n: n, distances: distances, labels: labels}}` where `distances`
   is `n * k` `f32-native` floats and `labels` is `n * k` `s64-native`
   integers, both row-major (`k` results per query). See the *Binary API*
-  section in the moduledoc for decoding examples.
+  section in the moduledoc for decoding examples, and `search/3` for the
+  `k` sizing note.
   """
   @spec search_binary(t(), binary(), pos_integer()) ::
           {:ok, %{n: non_neg_integer(), distances: binary(), labels: binary()}} | error()
   def search_binary(%__MODULE__{ref: ref, dim: dim}, queries, k) when is_binary(queries) do
-    {n, queries_bin} = encode_vector_data!(queries, dim)
+    {n, queries_bin} = Shared.encode_vector_data!(queries, dim)
 
     with {:ok, {distances_bin, labels_bin}} <- NIF.nif_search_index(ref, n, queries_bin, k) do
       {:ok, %{n: n, distances: distances_bin, labels: labels_bin}}
@@ -278,10 +315,15 @@ defmodule FaissEx.Index do
   Trains the index (required for IVF, PQ, etc.).
 
   Accepts the same list or binary vector forms as `add/2`.
+
+  An empty training set goes to FAISS, which decides: indexes that need no
+  training (`"Flat"`, `"HNSW32"`) return `:ok`, while indexes that do
+  (`"IVF4,Flat"`, `"PQ8"`) return `{:error, reason}` — k-means needs at
+  least as many points as clusters.
   """
   @spec train(t(), vector_data()) :: :ok | error()
   def train(%__MODULE__{ref: ref, dim: dim}, data) when is_list(data) or is_binary(data) do
-    {n, bin} = encode_vector_data!(data, dim)
+    {n, bin} = Shared.encode_vector_data!(data, dim)
     NIF.nif_train_index(ref, n, bin)
   end
 
@@ -331,33 +373,47 @@ defmodule FaissEx.Index do
   @spec reconstruct_binary(t(), id_data()) :: {:ok, binary()} | error()
   def reconstruct_binary(%__MODULE__{ref: ref}, keys)
       when is_list(keys) or is_binary(keys) do
-    {n, keys_bin} = encode_id_data!(keys)
+    {n, keys_bin} = Shared.encode_id_data!(keys)
     NIF.nif_reconstruct_batch(ref, n, keys_bin)
   end
 
   @doc """
   Computes residuals: `xs - reconstruct(keys)`.
 
-  Returns `{:ok, [[float]]}`, or `{:error, "key out of range"}` for a
-  negative key.
+  `xs` accepts the same list or binary forms as `add/2`, `keys` a list of
+  integers or an `s64-native` binary. Returns `{:ok, [[float]]}`, or
+  `{:error, "key out of range"}` for a negative key.
 
   Raises `ArgumentError` if a vector does not have `dim` elements, if a key
   is not an integer, or if the key count does not match the vector count.
   """
-  @spec compute_residuals(t(), vectors(), [integer()]) :: {:ok, [[float()]]} | error()
-  def compute_residuals(%__MODULE__{ref: ref, dim: dim}, xs, keys)
-      when is_list(xs) and is_list(keys) do
-    {n, data_bin} = Shared.encode_vectors!(xs, dim)
-    {n_keys, keys_bin} = Shared.encode_ids!(keys)
+  @spec compute_residuals(t(), vector_data(), id_data()) :: {:ok, [[float()]]} | error()
+  def compute_residuals(%__MODULE__{dim: dim} = index, xs, keys)
+      when (is_list(xs) or is_binary(xs)) and (is_list(keys) or is_binary(keys)) do
+    with {:ok, result_bin} <- compute_residuals_binary(index, xs, keys) do
+      {:ok, Shared.binary_to_float_rows(result_bin, dim)}
+    end
+  end
+
+  @doc """
+  Computes residuals and returns them as one raw binary — the zero-decode
+  counterpart of `compute_residuals/3`.
+
+  Takes the same arguments and raises on the same mistakes. Returns
+  `{:ok, binary}` with `n * dim` `f32-native` floats, row-major.
+  """
+  @spec compute_residuals_binary(t(), vector_data(), id_data()) :: {:ok, binary()} | error()
+  def compute_residuals_binary(%__MODULE__{ref: ref, dim: dim}, xs, keys)
+      when (is_list(xs) or is_binary(xs)) and (is_list(keys) or is_binary(keys)) do
+    {n, data_bin} = Shared.encode_vector_data!(xs, dim)
+    {n_keys, keys_bin} = Shared.encode_id_data!(keys)
 
     if n_keys != n do
       raise ArgumentError,
             "got #{n_keys} keys for #{n} vectors, expected one key per vector"
     end
 
-    with {:ok, result_bin} <- NIF.nif_compute_residuals(ref, n, data_bin, keys_bin) do
-      {:ok, Shared.binary_to_float_rows(result_bin, dim)}
-    end
+    NIF.nif_compute_residuals(ref, n, data_bin, keys_bin)
   end
 
   @doc """
@@ -376,11 +432,33 @@ defmodule FaissEx.Index do
 
   ## Options
 
-    * `:io_flags` - FAISS IO flags (default `0`)
+    * `:io_flags` - FAISS IO flags, a bitwise OR of the values below
+      (default `0`). Unknown options raise `ArgumentError`.
+
+  | Flag | Value | Effect |
+  |------|-------|--------|
+  | `IO_FLAG_READ_ONLY` | `2` | Open on-disk inverted lists read-only |
+  | `IO_FLAG_ONDISK_SAME_DIR` | `4` | Resolve on-disk inverted-list files in the index file's directory, ignoring the stored path |
+  | `IO_FLAG_SKIP_IVF_DATA` | `8` | Load an IVF index's structure without its inverted lists |
+
+  ## Trust boundary
+
+  Only load files you trust with the default flags. An index file can
+  describe an on-disk IVF index (`OnDiskInvertedLists`) whose inverted
+  lists live in a *separate* file named by a path stored inside the index
+  file. Loading it memory-maps that path — read-write unless
+  `IO_FLAG_READ_ONLY` is set — so a crafted file can make this process
+  map, read, and modify an arbitrary file it has access to.
+
+  For files from an untrusted source, pass `io_flags: 6`
+  (`IO_FLAG_READ_ONLY ||| IO_FLAG_ONDISK_SAME_DIR`): the stored path is
+  replaced by the index file's own directory and the mapping is read-only.
+  `IO_FLAG_READ_ONLY` alone is not enough — it still maps whatever path
+  the file names, read-only.
   """
   @spec from_file(String.t(), keyword()) :: {:ok, t()} | error()
   def from_file(path, opts \\ []) do
-    io_flags = Keyword.get(opts, :io_flags, 0)
+    io_flags = opts |> Keyword.validate!(io_flags: 0) |> Keyword.fetch!(:io_flags)
 
     with {:ok, ref} <- NIF.nif_read_index(path, io_flags) do
       # Hard match on purpose: we just opened this index, so a failure here
@@ -418,12 +496,14 @@ defmodule FaissEx.Index do
   @doc """
   Moves a CPU index to GPU.
 
-  Returns `{:error, "index already on GPU"}` if the index is already there.
+  `device_id` must be a non-negative integer. Returns
+  `{:error, "index already on GPU"}` if the index is already there.
   """
   @spec cpu_to_gpu(t(), non_neg_integer()) :: {:ok, t()} | error()
   def cpu_to_gpu(index, device_id \\ 0)
 
-  def cpu_to_gpu(%__MODULE__{device: :host} = index, device_id) do
+  def cpu_to_gpu(%__MODULE__{device: :host} = index, device_id)
+      when is_integer(device_id) and device_id >= 0 do
     with {:ok, {gpu_res_ref, gpu_idx_ref}} <- NIF.nif_index_cpu_to_gpu(index.ref, device_id) do
       {:ok,
        %__MODULE__{
@@ -435,7 +515,8 @@ defmodule FaissEx.Index do
     end
   end
 
-  def cpu_to_gpu(%__MODULE__{device: {:cuda, _}}, _device_id) do
+  def cpu_to_gpu(%__MODULE__{device: {:cuda, _}}, device_id)
+      when is_integer(device_id) and device_id >= 0 do
     {:error, "index already on GPU"}
   end
 
@@ -459,35 +540,5 @@ defmodule FaissEx.Index do
 
   def gpu_to_cpu(%__MODULE__{device: :host}) do
     {:error, "index already on host"}
-  end
-
-  defp encode_vector_data!(data, dim) when is_list(data), do: Shared.encode_vectors!(data, dim)
-
-  defp encode_vector_data!(data, dim) when is_binary(data) do
-    row_size = dim * 4
-
-    case rem(byte_size(data), row_size) do
-      0 ->
-        {div(byte_size(data), row_size), data}
-
-      _ ->
-        raise ArgumentError,
-              "binary has #{byte_size(data)} bytes, expected a multiple of " <>
-                "#{row_size} (dim #{dim} * 4 bytes per f32)"
-    end
-  end
-
-  defp encode_id_data!(ids) when is_list(ids), do: Shared.encode_ids!(ids)
-
-  defp encode_id_data!(ids) when is_binary(ids) do
-    case rem(byte_size(ids), 8) do
-      0 ->
-        {div(byte_size(ids), 8), ids}
-
-      _ ->
-        raise ArgumentError,
-              "ids binary has #{byte_size(ids)} bytes, expected a multiple of " <>
-                "8 (one s64 per id)"
-    end
   end
 end
