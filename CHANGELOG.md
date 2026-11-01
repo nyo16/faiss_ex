@@ -1,5 +1,99 @@
 # Changelog
 
+## v0.4.0 (2026-11-01)
+
+Remediation release for the 2026-11-01 health audit: VM-abort and
+scheduler-starvation fixes, OpenMP control, a working `FAISS_OPT_LEVEL`,
+and a hardened build and CI. Contains behavior changes — read *Changed*
+before upgrading.
+
+### Changed (behavior)
+
+- **`add_with_ids/3` raises `ArgumentError`** when the id count does not
+  match the vector count (was `{:error, "binary size mismatch"}`), matching
+  `compute_residuals/3`.
+- **Options are validated.** Unknown keys in `Index.new/3` and
+  `Index.from_file/2` raise `ArgumentError` (a typo like `metrc:` used to be
+  ignored), and an invalid `:device` raises `ArgumentError` instead of
+  `CaseClauseError`. `cpu_to_gpu/2` requires a non-negative integer device.
+- **`Index.train(index, [])` goes to FAISS**: still `:ok` for indexes that
+  need no training (Flat, HNSW), but now `{:error, reason}` for indexes that
+  do (IVF, PQ) — it used to return `:ok` without training anything.
+- **`Clustering.train/2` no longer mutates its input.** Each call builds a
+  fresh FAISS clustering object and quantizer; the struct you pass in stays
+  untrained and usable, and two trains from one struct are independent.
+  Empty data returns `{:error, "n must be positive"}` before allocating.
+- **`FAISS_OPT_LEVEL` defaults to `dd`** (runtime SIMD dispatch: AVX2 /
+  AVX-512 on x86-64, NEON / SVE on aarch64). Only `dd` and `generic` are
+  accepted. Upgrading triggers one FAISS rebuild; the old
+  `~/.cache/faiss_ex/faiss-v1.15.1/build/` directory is no longer used and
+  can be deleted.
+- **Locked NIFs wait on dirty-IO schedulers under contention.** A call
+  that finds its index locked moves to the dirty-IO pool to wait (size it
+  with `+SDio`) instead of occupying a dirty-CPU thread.
+- Elixir 1.18 / OTP 27 is the CI-tested floor (also tested: 1.19/28,
+  1.20/29). Building from source needs CMake 3.24+ and, for GPU builds, the
+  CUDA 12+ toolkit; both are checked before configuring.
+
+### Added
+
+- `FaissEx.set_omp_threads/1` and `config :faiss_ex, omp_threads: n`: the
+  OpenMP thread count FAISS uses per call. Measured on a 100k × 128 Flat
+  index: 10 processes × 200 single-query searches 1.5 s → 0.57 s with `1`;
+  one 1000-query batch 78 ms → 123 ms (keep the default for big batches).
+- Binary API for the remaining paths: `Index.search/3` and
+  `compute_residuals/3` accept binaries; `Index.compute_residuals_binary/3`;
+  `Clustering.train/2` and `get_cluster_assignment/2` accept binaries;
+  `Clustering.get_centroids_binary/1`.
+- Factory descriptions are capped at 256 bytes
+  (`{:error, "description too long"}`).
+
+### Fixed
+
+- **VM abort on reconstruct/residual errors.** FAISS runs
+  `compute_residual_n` and the generic `reconstruct_n` inside OpenMP
+  parallel regions; an exception there (a key past `ntotal`, or an index
+  type without `reconstruct` such as `IDMap,Flat`) cannot reach the C API's
+  error handling and terminated the whole BEAM. `compute_residuals(index,
+  [v], [5])` on a one-vector Flat index was enough. These now return
+  `{:error, reason}`. Present since `compute_residuals` and `reconstruct`
+  were added.
+- **Dirty-scheduler starvation.** One waiter per dirty-CPU scheduler on a
+  busy index (e.g. searches during a long `train`) pinned the whole
+  dirty-CPU pool, so work on *unrelated* indexes queued for seconds. A
+  search on an idle index during such a train now takes ~0.04 ms.
+- **`FAISS_OPT_LEVEL=avx2|avx512` was a silent no-op** (FAISS builds those
+  as separately named libraries the build never installed).
+- **Stale FAISS builds.** Switching `FAISS_OPT_LEVEL` or `USE_CUDA` reused
+  the previous build. Each configuration now has its own build directory,
+  and a configuration stamp re-copies libraries and re-links the NIF.
+- **`FaissEx.num_gpus/0` on CUDA builds** called `faiss_get_num_gpus`
+  without its output parameter and returned the status code (0); GCC 14
+  also rejected the implicit declaration, breaking CUDA builds.
+- **Negative GPU device ids** aborted inside CUDA; now rejected.
+- **Misaligned binary input** (sub-binaries from `binary_part/3` or pattern
+  matches) was passed to FAISS as misaligned `float*`/`int64*` — undefined
+  behavior. Misaligned input is now copied to an aligned buffer.
+- `INT64_MAX` reconstruction keys on the per-key path signed-overflowed
+  FAISS's bound check; now `{:error, "key out of range"}`.
+- `nif_new_index` ran on a normal scheduler; factory parsing and large
+  quantizer allocation now run dirty.
+
+### Security
+
+- `Index.from_file/2` documents its trust boundary: an on-disk IVF index
+  file can make the loader memory-map an arbitrary path it names. Use
+  `io_flags: 6` for untrusted files (flag table in the docs).
+- Factory descriptions are documented as trusted input (they size
+  allocations).
+- Build: `FAISS_GIT_REV`/`FAISS_GIT_REPO` are allow-listed (`https://`
+  only), recipe paths are quoted, and the pinned FAISS commit is
+  re-verified on every build, so a tampered warm cache fails closed.
+- CI: actions pinned by commit SHA with Dependabot, `contents: read`
+  permissions, no persisted checkout credentials, job timeouts,
+  `mix hex.audit`, validated release tag versions, and a protected `hex`
+  environment for publishing.
+
 ## v0.3.2 (2026-10-31)
 
 ### Changed
