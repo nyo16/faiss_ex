@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Elixir NIF bindings for FAISS (Facebook AI Similarity Search) via the C API (`libfaiss_c`). No external dependencies beyond `elixir_make`. Supports vector similarity search (L2, inner product), index factory, k-means clustering, and optional CUDA GPU support (CUDA 12.x required). FAISS is pinned at v1.15.1 via `FAISS_GIT_REV`, with `FAISS_GIT_SHA` holding the commit the tag must resolve to (verified post-clone; tags are mutable refs) — both are defined in BOTH `Makefile` and `mix.exs` (`make_env/0`); keep them in sync.
+Elixir NIF bindings for FAISS (Facebook AI Similarity Search) via the C API (`libfaiss_c`). No external dependencies beyond `elixir_make`. Supports vector similarity search (L2, inner product), index factory, k-means clustering, and optional CUDA GPU support (CUDA 12.x required). FAISS is pinned at v1.15.1 via `FAISS_DEFAULT_REV`, with `FAISS_DEFAULT_SHA` holding the commit the tag must resolve to (verified post-clone and on every `make`; tags are mutable refs). The `Makefile` is the single source of every build default — `mix.exs` has no `make_env`; make inherits the caller's environment, and CI derives its cache keys from `FAISS_DEFAULT_REV`.
 
 ## Build & Test Commands
 
@@ -23,8 +23,11 @@ mix format           # Format code
 - The Makefile uses `NIF_CFLAGS`/`NIF_LDFLAGS` (not `CFLAGS`/`LDFLAGS`) to avoid leaking env vars into FAISS's cmake build. The cmake/make calls are wrapped in `env -u CFLAGS -u LDFLAGS -u CXXFLAGS`.
 - macOS Apple Silicon requires OpenMP hints for cmake (`-DOpenMP_ROOT=/opt/homebrew/opt/libomp`)
 - macOS rpath: `install_name_tool -id @rpath/libfaiss.dylib` (no `lib/` prefix — avoids double lib/ in path)
-- `Mix.Project.app_path()` cannot be called in `make_env/0` — `elixir_make` sets `MIX_APP_PATH` automatically
-- FAISS is cloned to `~/.cache/faiss_ex/faiss-<rev>/` and built in-tree (`build/` subdir)
+- `elixir_make` sets `MIX_APP_PATH` automatically; do not reintroduce a `make_env/0` (build defaults live only in the Makefile)
+- FAISS is cloned to `~/.cache/faiss_ex/faiss-<rev>/` and built in-tree in one directory per configuration: `build-<FAISS_OPT_LEVEL>-<cpu|gpu>/`
+- `$(PRIV_DIR)/.build_config` is a config stamp (build dir + NIF flags), rewritten only when it changes; the NIF and both `priv/lib` copies depend on it so switching configurations re-copies and re-links
+- `FAISS_OPT_LEVEL` accepts only `dd` (default, runtime SIMD dispatch) and `generic`; FAISS's `avx2`/`avx512`/`sve` levels build differently named libs (`libfaiss_c_avx2` links `libfaiss_avx2`) and are rejected with `$(error)`
+- The Makefile must stay GNU Make 3.81-compatible (macOS ships 3.81): no `$(file ...)`, no `.ONESHELL`
 - `FAISS_PREFIX` env var: when set, uses system-installed FAISS instead of building from source
 
 ## Architecture

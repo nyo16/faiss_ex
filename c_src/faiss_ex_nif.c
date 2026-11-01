@@ -14,6 +14,7 @@
 #ifdef FAISS_GPU_ENABLED
 #include "c_api/gpu/StandardGpuResources_c.h"
 #include "c_api/gpu/GpuAutoTune_c.h"
+#include "c_api/gpu/DeviceUtils_c.h"
 #endif
 
 /* FaissEx.Index passes metric as a bare integer; these pin the values it
@@ -811,7 +812,12 @@ static ERL_NIF_TERM nif_index_gpu_to_cpu(ErlNifEnv *env, int argc, const ERL_NIF
 static ERL_NIF_TERM nif_get_num_gpus(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     (void)argv;
-    return make_ok(env, enif_make_int(env, faiss_get_num_gpus()));
+    /* The C API returns a status and writes the count through the pointer. */
+    int num_gpus = 0;
+    if (faiss_get_num_gpus(&num_gpus) != 0) {
+        return make_faiss_error(env, "failed to query GPU count");
+    }
+    return make_ok(env, enif_make_int(env, num_gpus));
 }
 
 #else /* !FAISS_GPU_ENABLED */
