@@ -3,142 +3,128 @@ name: CI
 on:
   push:
     branches: [master]
+  # No base-branch filter: stacked PRs (base = another PR branch) need CI too.
   pull_request:
-    branches: [master]
+
+permissions:
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   MIX_ENV: test
   ELIXIR_VERSION: "1.19"
-  OTP_VERSION: "28.0"
+  OTP_VERSION: "28"
 
 jobs:
-  setup:
-    name: Setup
-    runs-on: ubuntu-22.04
-    outputs:
-      cache-key: ${{ steps.key.outputs.value }}
-      faiss-key: ${{ steps.key.outputs.faiss }}
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
-
-      - uses: erlef/setup-beam@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          otp-version: ${{ env.OTP_VERSION }}
-          elixir-version: ${{ env.ELIXIR_VERSION }}
+          persist-credentials: false
 
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake libopenblas-dev
-
-      # RUNNER_ARCH is part of both keys: a FAISS build is native machine
-      # code, and macos-15-intel (X64) / macos-15 (ARM64) both report runner.os
-      # "macOS". Keyed on the OS alone they would share — and poison — one
-      # cache entry with wrong-architecture binaries.
-      - name: Compute cache keys
-        id: key
-        env:
-          SRC_HASH: ${{ hashFiles('mix.lock', 'c_src/**', 'Makefile') }}
-          RUNNER_OS: ${{ runner.os }}
-          RUNNER_ARCH: ${{ runner.arch }}
-        run: |
-          FAISS_REV=$(sed -n 's/^FAISS_GIT_REV *?= *//p' Makefile | tr -d ' ')
-          echo "value=${RUNNER_OS}-${RUNNER_ARCH}-mix-${ELIXIR_VERSION}-${OTP_VERSION}-test-${SRC_HASH}-${FAISS_REV}" >> "$GITHUB_OUTPUT"
-          echo "faiss=${RUNNER_OS}-${RUNNER_ARCH}-faiss-${FAISS_REV}" >> "$GITHUB_OUTPUT"
-
-      # FAISS source build (~10 min) is cached independently of the NIF/deps
-      # so c_src/lib changes don't rebuild FAISS
-      - name: Cache FAISS build
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/faiss_ex
-          key: ${{ steps.key.outputs.faiss }}
-
-      - name: Cache deps & build
-        id: cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            deps
-            _build/test
-          key: ${{ steps.key.outputs.value }}
-
-      - run: mix deps.get
-        if: steps.cache.outputs.cache-hit != 'true'
-
-      - run: mix compile --warnings-as-errors
-        if: steps.cache.outputs.cache-hit != 'true'
-
-  format:
-    name: Formatting
-    runs-on: ubuntu-22.04
-    needs: [setup]
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
 
       - run: mix format --check-formatted
 
+      - run: mix deps.get
+
+      # Fails on retired Hex packages in mix.lock
+      - run: mix hex.audit
+
+      # credo needs only `loadpaths` (deps), never the NIF/FAISS build
+      - run: mix credo --strict
+
+  # Every test job is self-contained (FAISS cached on its own key, then
+  # deps.get + compile) instead of a setup -> restore handoff: a handoff
+  # restoring with fail-on-cache-miss would have to be matrixed through
+  # every job to save one cache block.
+  #
+  # The FAISS key holds everything the cached build depends on:
+  #   RUNNER_OS/RUNNER_ARCH  native machine code; macos-15-intel (X64) and
+  #                          macos-15 (ARM64) both report runner.os "macOS"
+  #   ImageOS                the runner image (ubuntu24, macos15): a FAISS
+  #                          built against one image's libs must not restore
+  #                          onto another
+  #   FAISS_DEFAULT_REV      the pinned FAISS release
+  #   hashFiles('Makefile')  build flags, opt level, cmake configuration
   test:
-    name: Tests
-    runs-on: ubuntu-22.04
-    needs: [setup]
+    name: Tests (Linux amd64, Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { elixir: "1.18", otp: "27" } # supported floor
+          - { elixir: "1.19", otp: "28" }
+          - { elixir: "1.20", otp: "29" } # latest
     steps:
-      - uses: actions/checkout@v6
-
-      - uses: erlef/setup-beam@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          otp-version: ${{ env.OTP_VERSION }}
-          elixir-version: ${{ env.ELIXIR_VERSION }}
+          persist-credentials: false
 
-      - name: Install runtime dependencies
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          otp-version: ${{ matrix.otp }}
+          elixir-version: ${{ matrix.elixir }}
+
+      - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake libopenblas-dev
 
-      - uses: actions/cache/restore@v5
+      - name: Compute FAISS cache key
+        id: key
+        env:
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+          MAKEFILE_HASH: ${{ hashFiles('Makefile') }}
+        run: |
+          FAISS_REV=$(sed -n 's/^FAISS_DEFAULT_REV *:= *//p' Makefile | tr -d ' ')
+          echo "faiss=${RUNNER_OS}-${RUNNER_ARCH}-${ImageOS}-faiss-${FAISS_REV}-${MAKEFILE_HASH}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache FAISS build
+        id: faiss
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/faiss_ex
-          key: ${{ needs.setup.outputs.faiss-key }}
-          fail-on-cache-miss: true
+          key: ${{ steps.key.outputs.faiss }}
 
-      - uses: actions/cache/restore@v5
-        with:
-          path: |
-            deps
-            _build/test
-          key: ${{ needs.setup.outputs.cache-key }}
-          fail-on-cache-miss: true
+      - run: mix deps.get
 
-      - run: mix test --include slow
+      - run: mix compile --warnings-as-errors
 
-  # The jobs above are ubuntu-22.04, i.e. Linux/amd64 only. This matrix
-  # covers the three native targets they miss.
+      - run: mix test --include slow --cover
+
+  # The matrix above is Linux/amd64 only. This one covers the three native
+  # targets it misses.
   #
   # macOS is the important one: the Makefile has a large darwin-only path
   # (install_name_tool @rpath/@loader_path rewriting, libomp discovery,
-  # FAISS_ENABLE_MKL=OFF) that no job exercised. macos-15 is Apple Silicon,
-  # macos-15-intel is Intel — both matter, because the two differ in Homebrew
-  # prefix and in whether Accelerate or OpenBLAS backs BLAS.
-  #
-  # Self-contained rather than folded into the setup -> restore handoff
-  # above: that flow restores with fail-on-cache-miss, so every extra target
-  # would have to be matrixed through all three jobs to save one cache block.
+  # FAISS_ENABLE_MKL=OFF) that no Linux job exercises. macos-15 is Apple
+  # Silicon, macos-15-intel is Intel — both matter, because the two differ in
+  # Homebrew prefix and in whether Accelerate or OpenBLAS backs BLAS.
   test-native:
     name: Tests (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
           - { runner: macos-15, label: macOS arm64 }
           - { runner: macos-15-intel, label: macOS amd64 }
-          - { runner: ubuntu-22.04-arm, label: Linux arm64 }
+          - { runner: ubuntu-24.04-arm, label: Linux arm64 }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -158,12 +144,14 @@ jobs:
         env:
           RUNNER_OS: ${{ runner.os }}
           RUNNER_ARCH: ${{ runner.arch }}
+          MAKEFILE_HASH: ${{ hashFiles('Makefile') }}
         run: |
-          FAISS_REV=$(sed -n 's/^FAISS_GIT_REV *?= *//p' Makefile | tr -d ' ')
-          echo "faiss=${RUNNER_OS}-${RUNNER_ARCH}-faiss-${FAISS_REV}" >> "$GITHUB_OUTPUT"
+          FAISS_REV=$(sed -n 's/^FAISS_DEFAULT_REV *:= *//p' Makefile | tr -d ' ')
+          echo "faiss=${RUNNER_OS}-${RUNNER_ARCH}-${ImageOS}-faiss-${FAISS_REV}-${MAKEFILE_HASH}" >> "$GITHUB_OUTPUT"
 
       - name: Cache FAISS build
-        uses: actions/cache@v5
+        id: faiss
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/faiss_ex
           key: ${{ steps.key.outputs.faiss }}
@@ -173,3 +161,36 @@ jobs:
       - run: mix compile --warnings-as-errors
 
       - run: mix test --include slow
+
+  # No GPU runner is available, so the CUDA build of the NIF is otherwise
+  # never compiled. This syntax-checks c_src with FAISS_GPU_ENABLED against
+  # the pinned FAISS headers and the CUDA 12 toolkit headers they include.
+  cuda-syntax:
+    name: CUDA syntax check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: nvidia/cuda:12.6.3-devel-ubuntu24.04
+    steps:
+      - name: Install build dependencies
+        run: apt-get update && apt-get install -y --no-install-recommends erlang-dev git gcc make ca-certificates
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # verify-faiss clones the pinned FAISS rev and checks FAISS_DEFAULT_SHA
+      # with the same Makefile logic a real build uses (headers only; no
+      # configure or build).
+      - name: Fetch and verify pinned FAISS headers
+        run: MIX_APP_PATH="$RUNNER_TEMP/app" make verify-faiss
+
+      - name: Syntax-check the NIF with FAISS_GPU_ENABLED
+        run: |
+          FAISS_REV=$(sed -n 's/^FAISS_DEFAULT_REV *:= *//p' Makefile | tr -d ' ')
+          ERTS_INCLUDE=$(erl -noshell -eval 'io:format("~ts/erts-~ts/include", [code:root_dir(), erlang:system_info(version)])' -s init stop)
+          cc -std=c11 -fsyntax-only -Wall -Wextra -Wno-unused-parameter -Werror \
+            -DFAISS_GPU_ENABLED \
+            -I"$ERTS_INCLUDE" \
+            -I"$HOME/.cache/faiss_ex/faiss-${FAISS_REV}" \
+            -I/usr/local/cuda/include \
+            c_src/faiss_ex_nif.c
