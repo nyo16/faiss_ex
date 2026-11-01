@@ -166,6 +166,40 @@ else
 endif
 endif
 
+# OpenMP for the NIF itself (FaissEx.set_omp_threads/1 calls
+# omp_set_num_threads). The NIF must link the *same* runtime libfaiss uses:
+# two OpenMP runtimes in one process hang or crash. On macOS that is the
+# LIBOMP_PREFIX libomp FAISS was configured with; on Linux, -fopenmp with
+# the default cc (GCC) gives libgomp, which the default g++ build of FAISS
+# links too. A system FAISS linked against Intel's libiomp5, or a macOS
+# build without libomp, gets FAISS_EX_NO_OMP: the setting is accepted and
+# ignored.
+ifdef FAISS_PREFIX
+  ifeq ($(UNAME_S),Darwin)
+    FAISS_LINKED_LIBS := $(shell otool -L "$(SYSTEM_LIB_DIR)/libfaiss.dylib" 2>/dev/null)
+  else
+    FAISS_LINKED_LIBS := $(shell readelf -d "$(SYSTEM_LIB_DIR)/libfaiss.so" 2>/dev/null)
+  endif
+  ifneq ($(findstring iomp5,$(FAISS_LINKED_LIBS)),)
+    NIF_OMP_DISABLED := true
+  endif
+endif
+ifeq ($(UNAME_S),Darwin)
+  ifeq ($(LIBOMP_PREFIX),)
+    NIF_OMP_DISABLED := true
+  endif
+endif
+
+ifeq ($(NIF_OMP_DISABLED),true)
+  NIF_CFLAGS += -DFAISS_EX_NO_OMP
+else ifeq ($(UNAME_S),Darwin)
+  NIF_CFLAGS += -Xclang -fopenmp -I$(LIBOMP_PREFIX)/include
+  NIF_LDFLAGS += -L$(LIBOMP_PREFIX)/lib -lomp
+else
+  NIF_CFLAGS += -fopenmp
+  NIF_LDFLAGS += -fopenmp
+endif
+
 # Targets
 NIF_SO := $(PRIV_DIR)/libfaiss_ex.so
 

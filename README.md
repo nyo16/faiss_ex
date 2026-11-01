@@ -457,10 +457,50 @@ Indexes can be shared freely across processes — the NIF layer guards every ind
 
 - **Concurrent reads** (search, reconstruct, save, clone, property getters) run in parallel with each other
 - **Mutations** (add, train, reset) take the write lock and serialize against all other operations on the same index — racing an `add` against a `search` is safe and cannot crash the VM
-- Heavy operations (add, search, train) run on BEAM dirty CPU schedulers so they don't block normal Erlang processes, even while waiting on the lock
+- Heavy operations (add, search, train) run on BEAM dirty CPU schedulers so they don't block normal Erlang processes
+- A call that finds its index locked (say, a `search` while `train` holds the write lock) waits on a dirty **IO** scheduler instead, so waiters on one busy index never tie up the dirty-CPU pool that other indexes need
 - File I/O (to_file, from_file) runs on dirty IO schedulers
 
 For write-heavy concurrent workloads, note that mutations are serialized per index — shard across multiple indexes if you need parallel ingestion.
+
+### Concurrency tuning
+
+**Waiters and `+SDio`.** Callers waiting on a locked index share the dirty-IO
+pool (10 threads by default) with file I/O. If you expect more concurrent
+waiters than that — many processes searching an index that is being
+retrained — raise it: `+SDio 64` in `vm.args`, or
+`ELIXIR_ERL_OPTIONS="+SDio 64"`.
+
+**OpenMP threads.** FAISS parallelizes each call with OpenMP, one thread per
+core by default — even a single-query search on a large index. Many
+concurrent callers then multiply those teams across the dirty schedulers and
+oversubscribe the CPU. Set the thread count per workload:
+
+```elixir
+# config/runtime.exs — many concurrent small requests
+config :faiss_ex, omp_threads: 1
+
+# or at runtime; 0 restores the default
+FaissEx.set_omp_threads(1)
+```
+
+Measured on an Apple M1 Max (Flat index, 100k × 128, k = 10):
+
+| Workload | Default threads | `omp_threads: 1` |
+|----------|-----------------|------------------|
+| 10 processes × 200 single-query searches | 1529 ms | 586 ms |
+| One 1000-query batch search | 78 ms | 123 ms |
+
+Keep the default for few large batches (bulk `add`, `train`, batch search);
+use `1` for many concurrent small requests.
+
+On Linux, also:
+
+- install `libopenblas-openmp-dev` rather than the default pthreads OpenBLAS,
+  so BLAS threads come from the same OpenMP pool instead of a second nested
+  one;
+- consider `KMP_BLOCKTIME=0` (LLVM libomp) or `OMP_WAIT_POLICY=passive`
+  (GNU libgomp) so idle OpenMP threads stop spinning between calls.
 
 ## Architecture
 

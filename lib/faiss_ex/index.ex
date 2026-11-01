@@ -77,6 +77,17 @@ defmodule FaissEx.Index do
 
   Heavy operations run on dirty schedulers and never block the BEAM's
   normal schedulers, even while waiting on the lock.
+
+  Waiting never occupies the dirty-CPU pool. A call that finds its index's
+  lock taken (say, a `search/3` while `train/2` holds the write lock)
+  moves to a dirty-IO scheduler and waits there, so dirty-CPU threads stay
+  free for work on other indexes. Many callers waiting on one busy index
+  therefore share the dirty-IO pool (10 threads by default) with file I/O;
+  raise it with `+SDio N` in `vm.args` (or `ELIXIR_ERL_OPTIONS="+SDio N"`)
+  if you expect more concurrent waiters than that.
+
+  FAISS itself parallelizes each call with OpenMP; see
+  `FaissEx.set_omp_threads/1` for tuning many concurrent small calls.
   """
 
   alias FaissEx.NIF

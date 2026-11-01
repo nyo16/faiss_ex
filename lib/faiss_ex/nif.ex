@@ -10,7 +10,21 @@ defmodule FaissEx.NIF do
 
       priv_dir ->
         path = :filename.join(priv_dir, ~c"libfaiss_ex")
-        :erlang.load_nif(path, 0)
+        :erlang.load_nif(path, omp_threads_config())
+    end
+  end
+
+  # Initial OpenMP thread count for FAISS calls; FaissEx.set_omp_threads/1
+  # changes it at runtime. Validated here because a bad value would otherwise
+  # surface as an opaque NIF load failure.
+  defp omp_threads_config do
+    case Application.get_env(:faiss_ex, :omp_threads, 0) do
+      n when is_integer(n) and n >= 0 and n <= 0x7FFFFFFF ->
+        n
+
+      other ->
+        raise ArgumentError,
+              "config :faiss_ex, omp_threads: expected a non-negative integer, got: #{inspect(other)}"
     end
   end
 
@@ -39,4 +53,7 @@ defmodule FaissEx.NIF do
   def nif_new_clustering(_d, _k), do: :erlang.nif_error(:undef)
   def nif_train_clustering(_clust_ref, _n, _data, _idx_ref), do: :erlang.nif_error(:undef)
   def nif_get_clustering_centroids(_clust_ref), do: :erlang.nif_error(:undef)
+
+  # Runtime
+  def nif_set_omp_threads(_n), do: :erlang.nif_error(:undef)
 end
