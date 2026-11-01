@@ -18,8 +18,8 @@ Binds to FAISS via its official C API (`libfaiss_c`). No external dependencies b
 
 - Erlang/OTP 27+ with NIF support
 - Elixir 1.18+
-- A C/C++ compiler (clang or gcc)
-- **Either** a system FAISS installation **or** CMake 3.17+ to build from source (the default)
+- A C11 compiler for the NIF and a C++20 compiler for FAISS (GCC 10+, Clang 12+, or AppleClang 14+)
+- **Either** a system FAISS installation **or** CMake 3.24+ to build from source (the default; the build checks the version before configuring)
 
 There are no precompiled binaries: the first `mix compile` builds FAISS and the
 NIF from source as shared libraries, cached at `~/.cache/faiss_ex/` (~5–15 min,
@@ -36,8 +36,8 @@ brew install cmake libomp
 ```
 
 - BLAS comes from the built-in Accelerate framework — nothing to install
-- The build looks for libomp at `$HOMEBREW_PREFIX/opt/libomp` (defaults to
-  `/opt/homebrew` on Apple Silicon); set `HOMEBREW_PREFIX` if yours differs
+- libomp is auto-detected with `brew --prefix libomp`; set `LIBOMP_PREFIX` to
+  point the build at a different libomp keg
 
 ### Linux setup (Debian/Ubuntu)
 
@@ -48,7 +48,9 @@ sudo apt-get install -y build-essential cmake libopenblas-dev
 
 - `libopenblas-dev` provides the BLAS/LAPACK libraries FAISS links against
 - OpenMP (`libgomp`) ships with gcc — nothing extra to install
-- This is the exact recipe this project's CI uses (ubuntu-22.04)
+- This is the exact recipe this project's CI uses (ubuntu-24.04). Ubuntu
+  22.04 ships CMake 3.22, which is too old: install a newer one with
+  `pip install cmake` or from Kitware's apt repository (https://apt.kitware.com)
 
 ### Linux setup (Fedora/RHEL)
 
@@ -59,7 +61,8 @@ sudo dnf install -y gcc gcc-c++ make cmake openblas-devel
 ### GPU (optional)
 
 - CUDA toolkit **12.x** — FAISS 1.12.0+ dropped CUDA 11 (see the
-  [GPU Support](#gpu-support) section)
+  [GPU Support](#gpu-support) section). The build checks `nvcc --version` and
+  stops with an error below 12
 - Build with `USE_CUDA=true mix compile`
 
 ## Installation
@@ -120,31 +123,37 @@ FAISS_PREFIX=/opt/faiss mix compile
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FAISS_PREFIX` | *(unset)* | Path to system FAISS install. When set, skips building from source |
-| `FAISS_OPT_LEVEL` | `generic` | SIMD optimization level (see below). Only used when building from source |
-| `USE_CUDA` | `false` | Set to `true` to enable GPU support |
-| `FAISS_GIT_REPO` | `https://github.com/facebookresearch/faiss.git` | FAISS git repository (ignored when `FAISS_PREFIX` is set) |
+| `FAISS_OPT_LEVEL` | `dd` | SIMD optimization level: `dd` or `generic` (see below). Only used when building from source |
+| `USE_CUDA` | `false` | Set to `true` to enable GPU support (CUDA 12+) |
+| `FAISS_GIT_REPO` | `https://github.com/facebookresearch/faiss.git` | FAISS git repository, `https://` only (ignored when `FAISS_PREFIX` is set) |
 | `FAISS_GIT_REV` | `v1.15.1` | FAISS version tag or commit (ignored when `FAISS_PREFIX` is set) |
+| `FAISS_GIT_SHA` | commit of `v1.15.1` | Commit `FAISS_GIT_REV` must resolve to; checked after cloning and on every build. Empty skips the check (with a warning) |
+| `LIBOMP_PREFIX` | `brew --prefix libomp` | macOS only: the libomp keg FAISS and the NIF use |
 
 ### SIMD optimization
 
-FAISS uses SIMD instructions for fast distance computation. By default it builds with `generic` (portable) code. Set `FAISS_OPT_LEVEL` to enable optimized codepaths for your CPU:
+FAISS uses SIMD instructions for fast distance computation. The default,
+`dd` (dynamic dispatch), compiles every SIMD variant into `libfaiss` and picks
+the best one for the running CPU at load time: AVX2 or AVX-512 on x86-64, NEON
+or SVE on aarch64. One build is therefore fast on every CPU of its
+architecture.
 
-| Value | Platform | Instructions |
-|-------|----------|-------------|
-| `generic` | Any | Portable, no special instructions |
-| `avx2` | x86-64 | AVX2 + FMA (most Intel/AMD since ~2015) |
-| `avx512` | x86-64 | AVX-512 (Intel Xeon, AMD Zen 4+) |
-| `sve` | aarch64 | SVE (ARM Neoverse V1+) |
+| Value | Description |
+|-------|-------------|
+| `dd` | Runtime SIMD dispatch (default) |
+| `generic` | Portable code only, no SIMD dispatch |
+
+FAISS's `avx2`/`avx512`/`sve` levels are rejected: they build separately named
+libraries, and `dd` already dispatches to the same code paths.
 
 ```bash
-# Build with AVX2 optimizations
-FAISS_OPT_LEVEL=avx2 mix compile
-
-# Force a fresh FAISS build after changing opt level
-rm -rf ~/.cache/faiss_ex && FAISS_OPT_LEVEL=avx2 mix compile
+FAISS_OPT_LEVEL=generic mix compile
 ```
 
-> **Note:** Apple Silicon (M1-M4) uses NEON which is always enabled — `FAISS_OPT_LEVEL` has no effect on ARM macOS.
+Each FAISS build configuration (opt level × CPU/GPU) gets its own cached build
+directory, `~/.cache/faiss_ex/faiss-<rev>/build-<level>-<cpu|gpu>/`, so
+switching `FAISS_OPT_LEVEL` or `USE_CUDA` re-links the NIF against the matching
+build without clearing the cache.
 
 ### Runtime dependencies (releases & Docker)
 

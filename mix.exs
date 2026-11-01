@@ -4,11 +4,6 @@ defmodule FaissEx.MixProject do
   @version "0.3.2"
   @source_url "https://github.com/nyo16/faiss_ex"
 
-  # Keep rev+SHA in sync with Makefile. The SHA is what the tag must resolve
-  # to post-clone — tags are mutable refs, the commit is the real pin.
-  @faiss_git_rev "v1.15.1"
-  @faiss_git_sha "75c755c5a1fc854756aaf3bd1131213aeb21d8d1"
-
   def project do
     [
       app: :faiss_ex,
@@ -16,7 +11,7 @@ defmodule FaissEx.MixProject do
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       compilers: [:elixir_make] ++ Mix.compilers(),
-      make_env: make_env(),
+      test_coverage: [ignore_modules: [FaissEx.NIF], summary: [threshold: 90]],
       deps: deps(),
       name: "FaissEx",
       description: description(),
@@ -62,31 +57,10 @@ defmodule FaissEx.MixProject do
 
   defp deps do
     [
-      {:elixir_make, "~> 0.9", runtime: false},
+      {:elixir_make, "~> 0.10", runtime: false},
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},
       {:benchee, "~> 1.3", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
-  end
-
-  defp make_env do
-    rev = System.get_env("FAISS_GIT_REV", @faiss_git_rev)
-
-    # A custom rev builds unverified unless FAISS_GIT_SHA is provided with it.
-    default_sha = if rev == @faiss_git_rev, do: @faiss_git_sha, else: ""
-
-    env = %{
-      "USE_CUDA" => System.get_env("USE_CUDA", "false"),
-      "FAISS_OPT_LEVEL" => System.get_env("FAISS_OPT_LEVEL", "generic"),
-      "FAISS_GIT_REPO" =>
-        System.get_env("FAISS_GIT_REPO", "https://github.com/facebookresearch/faiss.git"),
-      "FAISS_GIT_REV" => rev,
-      "FAISS_GIT_SHA" => System.get_env("FAISS_GIT_SHA", default_sha)
-    }
-
-    case System.get_env("FAISS_PREFIX") do
-      nil -> env
-      prefix -> Map.put(env, "FAISS_PREFIX", prefix)
-    end
   end
 end
