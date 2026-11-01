@@ -2,6 +2,11 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdatomic.h>
+
+#ifndef FAISS_EX_NO_OMP
+#include <omp.h>
+#endif
 
 #include "c_api/Index_c.h"
 #include "c_api/index_factory_c.h"
@@ -52,6 +57,16 @@ _Static_assert(METRIC_L2 == 1, "FaissMetricType renumbered: update FaissEx.Index
  * Every NIF that can block on a lock must run on a dirty scheduler — a
  * writer may hold the lock for seconds (train), and blocking a normal
  * scheduler thread stalls the VM.
+ *
+ * Waiting happens on the dirty-IO pool, never the dirty-CPU pool. A dirty
+ * NIF that is merely blocked on a lock still occupies its scheduler thread,
+ * so N waiters on one busy index would hold every dirty-CPU thread and
+ * starve work on unrelated indexes. Each locked NIF therefore has two
+ * entries sharing one implementation (LOCKED_NIF below): the registered
+ * dirty-CPU entry validates, allocates, then only *tries* the lock; on
+ * contention it releases everything it allocated and reschedules itself as
+ * the <name>_io entry (dirty IO), which re-runs the same code and blocks.
+ * No lock is ever held across a reschedule.
  */
 
 static ErlNifResourceType *INDEX_RESOURCE_TYPE;
@@ -215,6 +230,63 @@ static void free_owned(void *owned) {
     if (owned) enif_free(owned);
 }
 
+/* ========== Lock acquisition and rescheduling ========== */
+
+typedef enum { LOCK_TRY, LOCK_BLOCK } LockMode;
+
+/* Returns 1 with the lock held, 0 when LOCK_TRY met contention. */
+static int acquire_read(ErlNifRWLock *lock, LockMode mode) {
+    if (mode == LOCK_BLOCK) {
+        enif_rwlock_rlock(lock);
+        return 1;
+    }
+    return enif_rwlock_tryrlock(lock) == 0;
+}
+
+static int acquire_write(ErlNifRWLock *lock, LockMode mode) {
+    if (mode == LOCK_BLOCK) {
+        enif_rwlock_rwlock(lock);
+        return 1;
+    }
+    return enif_rwlock_tryrwlock(lock) == 0;
+}
+
+/* Declares name##_impl and defines the two entries described in the
+ * header comment: `name` (registered dirty CPU, LOCK_TRY) and `name##_io`
+ * (dirty IO, LOCK_BLOCK). */
+#define LOCKED_NIF(name)                                                              \
+    static ERL_NIF_TERM name##_impl(ErlNifEnv *, int, const ERL_NIF_TERM[], LockMode); \
+    static ERL_NIF_TERM name##_io(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) { \
+        return name##_impl(env, argc, argv, LOCK_BLOCK);                              \
+    }                                                                                 \
+    static ERL_NIF_TERM name(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {    \
+        return name##_impl(env, argc, argv, LOCK_TRY);                                \
+    }
+
+/* The contention path of a LOCK_TRY entry. The caller must already have
+ * released every allocation and holds no lock. */
+#define RESCHEDULE_BLOCKING(name, env, argc, argv) \
+    enif_schedule_nif((env), #name, ERL_NIF_DIRTY_JOB_IO_BOUND, name##_io, (argc), (argv))
+
+/* ========== OpenMP thread count ==========
+ *
+ * FaissEx.set_omp_threads/1 stores the count here; 0 means the runtime
+ * default captured at load (OMP_NUM_THREADS or the core count).
+ * omp_set_num_threads sets a per-thread ICV and dirty scheduler threads
+ * are reused across calls, so the value is applied on the calling thread
+ * before every FAISS compute call rather than once. Built with
+ * FAISS_EX_NO_OMP (libfaiss linked against a runtime this NIF cannot
+ * share, e.g. Intel iomp5), the setting is accepted and ignored. */
+static _Atomic int g_omp_threads = 0;
+static int g_omp_default = 1;
+
+static void apply_omp_threads(void) {
+#ifndef FAISS_EX_NO_OMP
+    int threads = atomic_load_explicit(&g_omp_threads, memory_order_relaxed);
+    omp_set_num_threads(threads > 0 ? threads : g_omp_default);
+#endif
+}
+
 /* Rejects strings (paths, factory descriptions) with interior NUL bytes,
  * which would silently truncate after null-termination. */
 static int contains_nul(const ErlNifBinary *bin) {
@@ -312,15 +384,18 @@ static ERL_NIF_TERM nif_new_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
 }
 
 /* nif_clone_index(ref) */
-static ERL_NIF_TERM nif_clone_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
+LOCKED_NIF(nif_clone_index)
+static ERL_NIF_TERM nif_clone_index_impl(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[],
+                                         LockMode mode) {
     IndexResource *res;
     if (!enif_get_resource(env, argv[0], INDEX_RESOURCE_TYPE, (void **)&res)) {
         return make_error_msg(env, "invalid index reference");
     }
 
     FaissIndex *cloned = NULL;
-    enif_rwlock_rlock(res->lock);
+    if (!acquire_read(res->lock, mode)) {
+        return RESCHEDULE_BLOCKING(nif_clone_index, env, argc, argv);
+    }
     int ret = faiss_clone_index(res->index, &cloned);
     enif_rwlock_runlock(res->lock);
     if (ret != 0) {
@@ -336,8 +411,9 @@ static ERL_NIF_TERM nif_clone_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
 }
 
 /* nif_add_to_index(ref, n, data_binary) */
-static ERL_NIF_TERM nif_add_to_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
+LOCKED_NIF(nif_add_to_index)
+static ERL_NIF_TERM nif_add_to_index_impl(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[],
+                                          LockMode mode) {
     IndexResource *res;
     ErlNifSInt64 n;
     ErlNifBinary data_bin;
@@ -360,7 +436,11 @@ static ERL_NIF_TERM nif_add_to_index(ErlNifEnv *env, int argc, const ERL_NIF_TER
         return make_error_msg(env, "out of memory");
     }
 
-    enif_rwlock_rwlock(res->lock);
+    apply_omp_threads();
+    if (!acquire_write(res->lock, mode)) {
+        free_owned(owned);
+        return RESCHEDULE_BLOCKING(nif_add_to_index, env, argc, argv);
+    }
     int ret = faiss_Index_add(res->index, (idx_t)n, (const float *)data);
     enif_rwlock_rwunlock(res->lock);
     free_owned(owned);
@@ -370,8 +450,9 @@ static ERL_NIF_TERM nif_add_to_index(ErlNifEnv *env, int argc, const ERL_NIF_TER
 }
 
 /* nif_add_with_ids_to_index(ref, n, data_binary, ids_binary) */
-static ERL_NIF_TERM nif_add_with_ids_to_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
+LOCKED_NIF(nif_add_with_ids_to_index)
+static ERL_NIF_TERM nif_add_with_ids_to_index_impl(ErlNifEnv *env, int argc,
+                                                   const ERL_NIF_TERM argv[], LockMode mode) {
     IndexResource *res;
     ErlNifSInt64 n;
     ErlNifBinary data_bin, ids_bin;
@@ -398,7 +479,12 @@ static ERL_NIF_TERM nif_add_with_ids_to_index(ErlNifEnv *env, int argc, const ER
         return make_error_msg(env, "out of memory");
     }
 
-    enif_rwlock_rwlock(res->lock);
+    apply_omp_threads();
+    if (!acquire_write(res->lock, mode)) {
+        free_owned(owned_data);
+        free_owned(owned_ids);
+        return RESCHEDULE_BLOCKING(nif_add_with_ids_to_index, env, argc, argv);
+    }
     int ret = faiss_Index_add_with_ids(res->index, (idx_t)n, (const float *)data,
                                        (const idx_t *)ids);
     enif_rwlock_rwunlock(res->lock);
@@ -410,8 +496,9 @@ static ERL_NIF_TERM nif_add_with_ids_to_index(ErlNifEnv *env, int argc, const ER
 }
 
 /* nif_search_index(ref, n, data_binary, k) */
-static ERL_NIF_TERM nif_search_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
+LOCKED_NIF(nif_search_index)
+static ERL_NIF_TERM nif_search_index_impl(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[],
+                                          LockMode mode) {
     IndexResource *res;
     ErlNifSInt64 n, k;
     ErlNifBinary data_bin;
@@ -460,7 +547,13 @@ static ERL_NIF_TERM nif_search_index(ErlNifEnv *env, int argc, const ERL_NIF_TER
         return make_error_msg(env, "out of memory");
     }
 
-    enif_rwlock_rlock(res->lock);
+    apply_omp_threads();
+    if (!acquire_read(res->lock, mode)) {
+        free_owned(owned);
+        enif_release_binary(&distances_bin);
+        enif_release_binary(&labels_bin);
+        return RESCHEDULE_BLOCKING(nif_search_index, env, argc, argv);
+    }
     int ret = faiss_Index_search(res->index, (idx_t)n, (const float *)data, (idx_t)k,
                                  (float *)distances_bin.data, (idx_t *)labels_bin.data);
     enif_rwlock_runlock(res->lock);
@@ -482,8 +575,9 @@ static ERL_NIF_TERM nif_search_index(ErlNifEnv *env, int argc, const ERL_NIF_TER
  * n == 0 goes to FAISS too: it decides whether an empty training set is an
  * error (IVF: fewer points than clusters) or a no-op (Flat, which needs no
  * training). aligned_input supplies a valid pointer for the empty input. */
-static ERL_NIF_TERM nif_train_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
+LOCKED_NIF(nif_train_index)
+static ERL_NIF_TERM nif_train_index_impl(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[],
+                                         LockMode mode) {
     IndexResource *res;
     ErlNifSInt64 n;
     ErlNifBinary data_bin;
@@ -505,7 +599,11 @@ static ERL_NIF_TERM nif_train_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         return make_error_msg(env, "out of memory");
     }
 
-    enif_rwlock_rwlock(res->lock);
+    apply_omp_threads();
+    if (!acquire_write(res->lock, mode)) {
+        free_owned(owned);
+        return RESCHEDULE_BLOCKING(nif_train_index, env, argc, argv);
+    }
     int ret = faiss_Index_train(res->index, (idx_t)n, (const float *)data);
     enif_rwlock_rwunlock(res->lock);
     free_owned(owned);
@@ -515,14 +613,17 @@ static ERL_NIF_TERM nif_train_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
 }
 
 /* nif_reset_index(ref) */
-static ERL_NIF_TERM nif_reset_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
+LOCKED_NIF(nif_reset_index)
+static ERL_NIF_TERM nif_reset_index_impl(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[],
+                                         LockMode mode) {
     IndexResource *res;
     if (!enif_get_resource(env, argv[0], INDEX_RESOURCE_TYPE, (void **)&res)) {
         return make_error_msg(env, "invalid index reference");
     }
 
-    enif_rwlock_rwlock(res->lock);
+    if (!acquire_write(res->lock, mode)) {
+        return RESCHEDULE_BLOCKING(nif_reset_index, env, argc, argv);
+    }
     int ret = faiss_Index_reset(res->index);
     enif_rwlock_rwunlock(res->lock);
     if (ret != 0) {
@@ -533,8 +634,9 @@ static ERL_NIF_TERM nif_reset_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
 }
 
 /* nif_reconstruct_batch(ref, n, keys_binary) */
-static ERL_NIF_TERM nif_reconstruct_batch(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
+LOCKED_NIF(nif_reconstruct_batch)
+static ERL_NIF_TERM nif_reconstruct_batch_impl(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[],
+                                               LockMode mode) {
     IndexResource *res;
     ErlNifSInt64 n;
     ErlNifBinary keys_bin;
@@ -599,7 +701,12 @@ static ERL_NIF_TERM nif_reconstruct_batch(ErlNifEnv *env, int argc, const ERL_NI
     int dim = res->dim;
     int ret = 0;
 
-    enif_rwlock_rlock(res->lock);
+    apply_omp_threads();
+    if (!acquire_read(res->lock, mode)) {
+        free_owned(owned);
+        enif_release_binary(&result_bin);
+        return RESCHEDULE_BLOCKING(nif_reconstruct_batch, env, argc, argv);
+    }
     if (contiguous) {
         ret = faiss_Index_reconstruct_n(res->index, keys[0], (idx_t)n, result);
     } else {
@@ -620,8 +727,9 @@ static ERL_NIF_TERM nif_reconstruct_batch(ErlNifEnv *env, int argc, const ERL_NI
 }
 
 /* nif_compute_residuals(ref, n, data_binary, keys_binary) */
-static ERL_NIF_TERM nif_compute_residuals(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
+LOCKED_NIF(nif_compute_residuals)
+static ERL_NIF_TERM nif_compute_residuals_impl(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[],
+                                               LockMode mode) {
     IndexResource *res;
     ErlNifSInt64 n;
     ErlNifBinary data_bin, keys_bin;
@@ -667,7 +775,13 @@ static ERL_NIF_TERM nif_compute_residuals(ErlNifEnv *env, int argc, const ERL_NI
         return make_error_msg(env, err);
     }
 
-    enif_rwlock_rlock(res->lock);
+    apply_omp_threads();
+    if (!acquire_read(res->lock, mode)) {
+        free_owned(owned_data);
+        free_owned(owned_keys);
+        enif_release_binary(&result_bin);
+        return RESCHEDULE_BLOCKING(nif_compute_residuals, env, argc, argv);
+    }
     int ret = faiss_Index_compute_residual_n(res->index, (idx_t)n, (const float *)data,
                                              (float *)result_bin.data, keys);
     enif_rwlock_runlock(res->lock);
@@ -933,8 +1047,9 @@ static ERL_NIF_TERM nif_new_clustering(ErlNifEnv *env, int argc, const ERL_NIF_T
 }
 
 /* nif_train_clustering(clust_ref, n, data_binary, idx_ref) */
-static ERL_NIF_TERM nif_train_clustering(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
+LOCKED_NIF(nif_train_clustering)
+static ERL_NIF_TERM nif_train_clustering_impl(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[],
+                                              LockMode mode) {
     ClusteringResource *clust_res;
     ErlNifSInt64 n;
     ErlNifBinary data_bin;
@@ -964,9 +1079,18 @@ static ERL_NIF_TERM nif_train_clustering(ErlNifEnv *env, int argc, const ERL_NIF
 
     /* Training mutates both the clustering state and the quantizer index.
      * Lock order: index first, then clustering; release in the mirror
-     * order. */
-    enif_rwlock_rwlock(idx_res->lock);
-    enif_rwlock_rwlock(clust_res->lock);
+     * order. Under LOCK_TRY, failing the second lock releases the first
+     * before rescheduling. */
+    apply_omp_threads();
+    if (!acquire_write(idx_res->lock, mode)) {
+        free_owned(owned);
+        return RESCHEDULE_BLOCKING(nif_train_clustering, env, argc, argv);
+    }
+    if (!acquire_write(clust_res->lock, mode)) {
+        enif_rwlock_rwunlock(idx_res->lock);
+        free_owned(owned);
+        return RESCHEDULE_BLOCKING(nif_train_clustering, env, argc, argv);
+    }
     int ret = faiss_Clustering_train(clust_res->clustering, (idx_t)n, (const float *)data,
                                      idx_res->index);
     enif_rwlock_rwunlock(clust_res->lock);
@@ -978,8 +1102,9 @@ static ERL_NIF_TERM nif_train_clustering(ErlNifEnv *env, int argc, const ERL_NIF
 }
 
 /* nif_get_clustering_centroids(clust_ref) - returns {k, d, centroids_binary} */
-static ERL_NIF_TERM nif_get_clustering_centroids(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void)argc;
+LOCKED_NIF(nif_get_clustering_centroids)
+static ERL_NIF_TERM nif_get_clustering_centroids_impl(ErlNifEnv *env, int argc,
+                                                      const ERL_NIF_TERM argv[], LockMode mode) {
     ClusteringResource *res;
     if (!enif_get_resource(env, argv[0], CLUSTERING_RESOURCE_TYPE, (void **)&res)) {
         return make_error_msg(env, "invalid clustering reference");
@@ -1002,7 +1127,10 @@ static ERL_NIF_TERM nif_get_clustering_centroids(ErlNifEnv *env, int argc, const
     float *centroids = NULL;
     size_t centroids_size = 0;
 
-    enif_rwlock_rlock(res->lock);
+    if (!acquire_read(res->lock, mode)) {
+        enif_release_binary(&bin);
+        return RESCHEDULE_BLOCKING(nif_get_clustering_centroids, env, argc, argv);
+    }
     faiss_Clustering_centroids(res->clustering, &centroids, &centroids_size);
     if (!centroids || centroids_size == 0) {
         err = "no centroids available";
@@ -1022,6 +1150,19 @@ static ERL_NIF_TERM nif_get_clustering_centroids(ErlNifEnv *env, int argc, const
         enif_make_int64(env, (int64_t)res->k),
         enif_make_int64(env, (int64_t)res->d),
         enif_make_binary(env, &bin)));
+}
+
+/* ========== NIF: Runtime ========== */
+
+/* nif_set_omp_threads(n) — an atomic store, so a normal scheduler. */
+static ERL_NIF_TERM nif_set_omp_threads(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    int threads;
+    if (!enif_get_int(env, argv[0], &threads) || threads < 0) {
+        return make_error_msg(env, "invalid arguments");
+    }
+    atomic_store(&g_omp_threads, threads);
+    return atom_ok;
 }
 
 /* ========== NIF Init ========== */
@@ -1051,27 +1192,41 @@ static void init_atoms(ErlNifEnv *env) {
     atom_false = enif_make_atom(env, "false");
 }
 
+/* load_info is the initial OpenMP thread count (FaissEx.NIF reads it from
+ * `config :faiss_ex, omp_threads: n`); 0 keeps the runtime default. */
+static int init_omp(ErlNifEnv *env, ERL_NIF_TERM load_info) {
+    int threads;
+    if (!enif_get_int(env, load_info, &threads) || threads < 0) return -1;
+#ifndef FAISS_EX_NO_OMP
+    g_omp_default = omp_get_max_threads();
+#endif
+    atomic_store(&g_omp_threads, threads);
+    return 0;
+}
+
 static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     (void)priv_data;
-    (void)load_info;
     init_atoms(env);
+    if (init_omp(env, load_info) != 0) return -1;
     return register_resource_types(env, ERL_NIF_RT_CREATE);
 }
 
 static int on_upgrade(ErlNifEnv *env, void **priv_data, void **old_priv_data, ERL_NIF_TERM load_info) {
     (void)priv_data;
     (void)old_priv_data;
-    (void)load_info;
     init_atoms(env);
+    if (init_omp(env, load_info) != 0) return -1;
     return register_resource_types(env, ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER);
 }
 
-/* Getters reading mutable state (ntotal/is_trained) run dirty too: they
- * block on the rwlock, and a writer (train/add) may hold it for seconds.
- * The dim getter reads the immutable cached field without the lock, so it
- * stays on a normal scheduler. nif_new_index runs the factory parser and
- * allocates the index (an "IVF<n>" quantizer can be large), so it is dirty
- * too; nif_get_num_gpus initializes the CUDA runtime on first call. */
+/* Every entry that may wait on a lock is dirty. The locked compute/mutation
+ * NIFs are LOCKED_NIF pairs: registered dirty CPU, waiting (if any) on
+ * their <name>_io twin, which enif_schedule_nif reaches without a table
+ * entry. The ntotal/is_trained getters do no CPU work, so they are dirty IO
+ * and simply block there. The dim getter reads the immutable cached field
+ * without the lock, so it stays on a normal scheduler. nif_new_index runs
+ * the factory parser and allocates the index (an "IVF<n>" quantizer can be
+ * large); nif_get_num_gpus initializes the CUDA runtime on first call. */
 static ErlNifFunc nif_funcs[] = {
     /* Index */
     {"nif_new_index", 3, nif_new_index, ERL_NIF_DIRTY_JOB_CPU_BOUND},
@@ -1086,8 +1241,8 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_write_index", 2, nif_write_index, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_read_index", 2, nif_read_index, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_get_index_dim", 1, nif_get_index_dim, 0},
-    {"nif_get_index_ntotal", 1, nif_get_index_ntotal, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_get_index_is_trained", 1, nif_get_index_is_trained, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_get_index_ntotal", 1, nif_get_index_ntotal, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_get_index_is_trained", 1, nif_get_index_is_trained, ERL_NIF_DIRTY_JOB_IO_BOUND},
     /* GPU */
     {"nif_index_cpu_to_gpu", 2, nif_index_cpu_to_gpu, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_index_gpu_to_cpu", 1, nif_index_gpu_to_cpu, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -1096,6 +1251,8 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_new_clustering", 2, nif_new_clustering, 0},
     {"nif_train_clustering", 4, nif_train_clustering, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_get_clustering_centroids", 1, nif_get_clustering_centroids, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    /* Runtime */
+    {"nif_set_omp_threads", 1, nif_set_omp_threads, 0},
 };
 
 ERL_NIF_INIT(Elixir.FaissEx.NIF, nif_funcs, on_load, NULL, on_upgrade, NULL)
