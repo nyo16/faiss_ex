@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.4.1 (2026-11-01)
+
+First release verified on real GPU hardware (DGX Spark: GB10, aarch64,
+CUDA 13.0).
+
+### Fixed
+
+- **Concurrent searches on one GPU index aborted the VM.** Searches ran in
+  parallel under the shared read lock, but FAISS's GPU resources are not
+  thread-safe; two at once failed FAISS's `StackDeviceMemory` assertion and
+  terminated the process. GPU indexes now take their lock exclusively for
+  every operation (CPU indexes still search in parallel).
+- **CUDA builds did not compile.** With `USE_CUDA=true` the NIF compile
+  lacked the CUDA include path that FAISS's GPU C API headers need
+  (`cuda_runtime_api.h`). The toolkit headers now come from `CUDA_HOME`
+  (default `/usr/local/cuda`).
+- **Linux builds were not relocatable.** `libfaiss_c` found `libfaiss.so`
+  only through the FAISS build directory in `~/.cache/faiss_ex`, because
+  the linker's default `--as-needed` dropped the NIF's direct `-lfaiss`. A
+  release or Docker image copied without that cache failed to load the NIF.
+  The NIF now links `libfaiss` directly and loads it from `priv/lib`; CI
+  checks that the NIF loads with the cache removed on every platform.
+
+### Changed
+
+- GPU docs: CUDA 12 or newer (13 verified), `CUDAARCHS` to target one GPU
+  architecture, per-index GPU memory reservation, and serialized GPU
+  operations.
+
+### Added
+
+- GPU vs CPU benchmarks on a DGX Spark (README, `bench/gpu_bench.exs`):
+  18–33× faster batched Flat search, ~5× faster add/train.
+
 ## v0.4.0 (2026-11-01)
 
 Remediation release for the 2026-11-01 health audit: VM-abort and

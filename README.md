@@ -60,7 +60,7 @@ sudo dnf install -y gcc gcc-c++ make cmake openblas-devel
 
 ### GPU (optional)
 
-- CUDA toolkit **12.x** — FAISS 1.12.0+ dropped CUDA 11 (see the
+- CUDA toolkit **12 or newer** — FAISS 1.12.0+ dropped CUDA 11 (see the
   [GPU Support](#gpu-support) section). The build checks `nvcc --version` and
   stops with an error below 12
 - Build with `USE_CUDA=true mix compile`
@@ -598,9 +598,19 @@ sudo apt install cmake
 USE_CUDA=true mix compile
 ```
 
-This requires the CUDA toolkit to be installed. The build adds `-DFAISS_ENABLE_GPU=ON` to cmake and compiles GPU-specific NIF functions.
+This requires the CUDA toolkit (`nvcc` on `PATH`; headers under `CUDA_HOME`,
+default `/usr/local/cuda`). The build adds `-DFAISS_ENABLE_GPU=ON` to cmake
+and compiles the GPU NIF functions. Set `CUDAARCHS` (read by CMake) to build
+only for your GPU's compute capability — much faster than the default list:
 
-> **Note:** FAISS 1.12.0+ (including the pinned v1.15.1) requires **CUDA 12.x** — CUDA 11 support was dropped upstream. If you are stuck on CUDA 11, build with `FAISS_GIT_REV=v1.11.0`.
+```bash
+USE_CUDA=true CUDAARCHS=121 mix compile   # e.g. NVIDIA GB10 (DGX Spark)
+```
+
+Verified on a DGX Spark (GB10, aarch64, CUDA 13.0): full suite including
+`--include cuda` passes, and GPU search results match CPU.
+
+> **Note:** FAISS 1.12.0+ (including the pinned v1.15.1) requires **CUDA 12 or newer** — CUDA 11 support was dropped upstream. If you are stuck on CUDA 11, build with `FAISS_GIT_REV=v1.11.0`.
 
 ### Moving indexes to GPU
 
@@ -638,7 +648,8 @@ num_gpus = FaissEx.num_gpus()
 - GPU resources (`FaissStandardGpuResources`) must outlive GPU indexes. FaissEx handles this automatically — the `%FaissEx.Index{}` struct holds both the GPU resources ref and the index ref, so BEAM GC keeps both alive.
 - You can create indexes on CPU, add vectors, then move to GPU for fast search.
 - File I/O requires CPU indexes — move back with `gpu_to_cpu/1` before saving.
-- Concurrent reads (search) on the same GPU index are safe. Concurrent writes (add) are not.
+- Every operation on a GPU index is serialized — searches included. FAISS's GPU resources are not thread-safe (concurrent searches on one GPU index abort the process inside FAISS), so a GPU index takes its lock exclusively. For throughput, send queries in batches rather than many concurrent single queries; see [GPU benchmarks](#gpu-dgx-spark).
+- Each `cpu_to_gpu/2` (and each `device: {:cuda, n}` index) gets its own FAISS GPU resources, which reserve GPU memory up front (~1.7 GB measured on a GB10). Create few GPU indexes per process.
 
 ### Running GPU tests
 
@@ -683,6 +694,48 @@ Run benchmarks yourself:
 
 ```bash
 mix run bench/faiss_ex_bench.exs
+```
+
+### GPU (DGX Spark)
+
+Measured 2026-11-01 on an NVIDIA DGX Spark: GB10 GPU (compute capability
+12.1) and 20-core Grace CPU (10× Cortex-X925 + 10× Cortex-A725), unified
+memory, driver 580.173.02, CUDA 13.0, Elixir 1.20.2 / OTP 29, FAISS v1.15.1
+(`dd`, OpenBLAS 0.3.34 with OpenMP). Data: 500,000 random 128-d vectors,
+binary API, k = 10; median of 3–21 runs (adds and training run once).
+
+| Scenario | CPU (ms) | GPU (ms) | GPU speedup |
+|----------|---------:|---------:|------------:|
+| Flat add 500k | 92.3 | 16.3 | 5.7× |
+| Flat search, 1 query | 6.36 | 3.33 | 1.9× |
+| Flat search, 100 queries | 203.0 | 6.13 | 33× |
+| Flat search, 1,000 queries | 785.8 | 27.3 | 29× |
+| Flat search, 10,000 queries | 4,830 | 268 | 18× |
+| IVF1024 train on 100k | 580.0 | 104.4 | 5.6× |
+| IVF1024 add 500k | 353.7 | 85.0 | 4.2× |
+| IVF1024 search, 1 query | 0.02 | 0.34 | 0.06× |
+| IVF1024 search, 1,000 queries | 4.35 | 1.51 | 2.9× |
+| IVF1024 search, 10,000 queries | 33.8 | 15.9 | 2.1× |
+
+`cpu_to_gpu/2` of a 100k × 128 Flat index: 185 ms. One GPU index reserves
+~1.7 GB of GPU memory for FAISS's temporary buffers.
+
+20 processes × 100 single-query searches on the 500k Flat index (2,000
+searches total):
+
+| Configuration | Wall time (ms) |
+|---------------|---------------:|
+| CPU, default OpenMP threads | 7,513 |
+| CPU, `FaissEx.set_omp_threads(1)` | 3,603 |
+| GPU (searches serialized, see GPU lifecycle notes) | 6,443 |
+
+Takeaways: the GPU wins by 18–33× on batched brute-force search and ~5× on
+add/train; single queries gain little (Flat) or lose to launch overhead (IVF,
+where the CPU answers in 20 µs). Many concurrent single queries are fastest on
+the CPU with one OpenMP thread per call — batch them if you want the GPU.
+
+```bash
+USE_CUDA=true CUDAARCHS=121 MIX_ENV=test mix run bench/gpu_bench.exs
 ```
 
 ## License

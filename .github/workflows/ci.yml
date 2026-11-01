@@ -100,6 +100,16 @@ jobs:
 
       - run: mix test --include slow --cover
 
+      # A release ships only priv/; the NIF must load with the FAISS build
+      # cache gone (Linux once resolved libfaiss.so through the cache).
+      - name: NIF loads without the FAISS build cache
+        run: |
+          mv ~/.cache/faiss_ex ~/.cache/faiss_ex.off
+          rc=0
+          mix run --no-compile -e '{:ok, i} = FaissEx.Index.new(4, "Flat"); :ok = FaissEx.Index.add(i, [[1.0, 2.0, 3.0, 4.0]])' || rc=$?
+          mv ~/.cache/faiss_ex.off ~/.cache/faiss_ex
+          exit "$rc"
+
   # The matrix above is Linux/amd64 only. This one covers the three native
   # targets it misses.
   #
@@ -161,6 +171,16 @@ jobs:
       - run: mix compile --warnings-as-errors
 
       - run: mix test --include slow
+
+      - name: NIF loads without the FAISS build cache
+        env:
+          MIX_ENV: test
+        run: |
+          mv ~/.cache/faiss_ex ~/.cache/faiss_ex.off
+          rc=0
+          mix run --no-compile -e '{:ok, i} = FaissEx.Index.new(4, "Flat"); :ok = FaissEx.Index.add(i, [[1.0, 2.0, 3.0, 4.0]])' || rc=$?
+          mv ~/.cache/faiss_ex.off ~/.cache/faiss_ex
+          exit "$rc"
 
   # No GPU runner is available, so the CUDA build of the NIF is otherwise
   # never compiled. This syntax-checks c_src with FAISS_GPU_ENABLED against
