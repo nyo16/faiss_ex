@@ -339,6 +339,11 @@ static int has_safe_reconstruct_n(FaissIndex *index) {
     return faiss_IndexFlat_cast(index) != NULL || faiss_IndexIVF_cast(index) != NULL;
 }
 
+/* Bit pattern of a signaling NaN that FAISS never produces when decoding a
+ * vector (a stored vector could only contain it if the caller added that
+ * exact NaN). Marks result rows a batched reconstruct did not write. */
+static const uint32_t UNWRITTEN_ROW_TAG = 0x7FA5A5A5u;
+
 /* Wraps a FaissIndex in a resource with its own rwlock.
  * Takes ownership: frees the index and returns 0 on failure. */
 static int wrap_index_resource(ErlNifEnv *env, FaissIndex *index, ERL_NIF_TERM *ref_out) {
@@ -722,7 +727,19 @@ static ERL_NIF_TERM nif_reconstruct_batch_impl(ErlNifEnv *env, int argc, const E
     float *result = (float *)result_bin.data;
     int dim = res->dim;
     int batched = contiguous && has_safe_reconstruct_n(res->index);
+    int used_batch = 0;
     int ret = 0;
+
+    /* IndexIVF::reconstruct_n writes only the rows whose *id* lies in the
+     * key range; on an IVF filled by add_with_ids with sparse ids, the
+     * other rows are never written, and returning them would leak
+     * uninitialized heap memory (verified v1.15.1). Tag every row first;
+     * a row still tagged afterwards had no vector with that id. */
+    if (batched) {
+        for (ErlNifSInt64 i = 0; i < n; i++) {
+            memcpy(result + i * dim, &UNWRITTEN_ROW_TAG, sizeof(UNWRITTEN_ROW_TAG));
+        }
+    }
 
     apply_omp_threads();
     if (!acquire_read(res->lock, mode)) {
@@ -731,6 +748,7 @@ static ERL_NIF_TERM nif_reconstruct_batch_impl(ErlNifEnv *env, int argc, const E
         return RESCHEDULE_BLOCKING(nif_reconstruct_batch, env, argc, argv);
     }
     if (batched && keys[0] + n <= faiss_Index_ntotal(res->index)) {
+        used_batch = 1;
         ret = faiss_Index_reconstruct_n(res->index, keys[0], (idx_t)n, result);
     } else {
         /* One guarded call per key, outside any parallel region: a key
@@ -746,6 +764,15 @@ static ERL_NIF_TERM nif_reconstruct_batch_impl(ErlNifEnv *env, int argc, const E
     if (ret != 0) {
         enif_release_binary(&result_bin);
         return make_faiss_error(env, "reconstruct failed");
+    }
+
+    if (used_batch) {
+        for (ErlNifSInt64 i = 0; i < n; i++) {
+            if (memcmp(result + i * dim, &UNWRITTEN_ROW_TAG, sizeof(UNWRITTEN_ROW_TAG)) == 0) {
+                enif_release_binary(&result_bin);
+                return make_error_msg(env, "key out of range");
+            }
+        }
     }
 
     return make_ok(env, enif_make_binary(env, &result_bin));

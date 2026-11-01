@@ -74,6 +74,11 @@ before upgrading.
 - **Misaligned binary input** (sub-binaries from `binary_part/3` or pattern
   matches) was passed to FAISS as misaligned `float*`/`int64*` — undefined
   behavior. Misaligned input is now copied to an aligned buffer.
+- **Uninitialized memory returned by IVF reconstruction.** For an IVF index
+  filled with `add_with_ids` and sparse ids, reconstructing a contiguous key
+  range returned heap contents for keys with no stored vector (FAISS's IVF
+  batched reconstruct skips them). Those keys now return
+  `{:error, "key out of range"}`. Present since v0.1.0.
 - `INT64_MAX` reconstruction keys on the per-key path signed-overflowed
   FAISS's bound check; now `{:error, "key out of range"}`.
 - `nif_new_index` ran on a normal scheduler; factory parsing and large

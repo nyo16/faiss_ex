@@ -941,6 +941,20 @@ defmodule FaissEx.IndexTest do
                {:ok, [[2.0, 0.0, 0.0, 1.0], [3.0, 0.0, 0.0, 1.0]]}
     end
 
+    test "an IVF id range with no stored vector errors instead of returning heap memory" do
+      # IndexIVF::reconstruct_n writes only rows whose id is in the range;
+      # with sparse custom ids the rest used to come back uninitialized.
+      {:ok, index} = Index.new(4, "IVF2,Flat")
+      data = for i <- 0..99, do: [i * 1.0, 0.0, 0.0, 1.0]
+      :ok = Index.train(index, data)
+      :ok = Index.add_with_ids(index, Enum.take(data, 3), [1, 2, 3])
+
+      assert {:error, "key out of range"} = Index.reconstruct(index, [0, 1])
+
+      assert Index.reconstruct(index, [1, 2]) ==
+               {:ok, [[0.0, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0]]}
+    end
+
     test "no keys reconstruct no rows" do
       {:ok, index} = Index.new(4, "Flat")
       assert {:ok, []} = Index.reconstruct(index, [])
