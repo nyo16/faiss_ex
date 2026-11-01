@@ -62,6 +62,16 @@ NIF_CFLAGS += -I$(ERTS_INCLUDE_DIR)
 
 NIF_LDFLAGS := -shared
 NIF_LDFLAGS += -L$(LIB_DIR)
+
+# Linux: libfaiss_c finds libfaiss.so only through the RUNPATH CMake gave it
+# (the FAISS build directory in ~/.cache), and the default --as-needed drops
+# the NIF's own -lfaiss because the NIF calls nothing in it. A release
+# copied without that cache then fails to load the NIF. --no-as-needed
+# keeps libfaiss.so a direct dependency, loaded from $ORIGIN/lib, so
+# libfaiss_c's reference is satisfied by the already-loaded copy.
+ifneq ($(UNAME_S),Darwin)
+  NIF_LDFLAGS += -Wl,--no-as-needed
+endif
 NIF_LDFLAGS += -lfaiss_c -lfaiss
 
 # C++ runtime for the transitive libfaiss dependency: LLVM libc++ on macOS,
@@ -75,8 +85,12 @@ else
   NIF_LDFLAGS += -Wl,-rpath,'$$ORIGIN/lib'
 endif
 
+# FAISS's GPU C API headers include cuda_runtime_api.h / cublas_v2.h, so the
+# NIF needs the toolkit's headers (it calls no CUDA function itself; libfaiss
+# links the CUDA runtime).
+CUDA_HOME ?= /usr/local/cuda
 ifeq ($(USE_CUDA),true)
-  NIF_CFLAGS += -DFAISS_GPU_ENABLED
+  NIF_CFLAGS += -DFAISS_GPU_ENABLED -I$(CUDA_HOME)/include
 endif
 
 # ========== System FAISS vs build from source ==========

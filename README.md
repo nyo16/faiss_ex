@@ -60,7 +60,7 @@ sudo dnf install -y gcc gcc-c++ make cmake openblas-devel
 
 ### GPU (optional)
 
-- CUDA toolkit **12.x** — FAISS 1.12.0+ dropped CUDA 11 (see the
+- CUDA toolkit **12 or newer** — FAISS 1.12.0+ dropped CUDA 11 (see the
   [GPU Support](#gpu-support) section). The build checks `nvcc --version` and
   stops with an error below 12
 - Build with `USE_CUDA=true mix compile`
@@ -598,9 +598,19 @@ sudo apt install cmake
 USE_CUDA=true mix compile
 ```
 
-This requires the CUDA toolkit to be installed. The build adds `-DFAISS_ENABLE_GPU=ON` to cmake and compiles GPU-specific NIF functions.
+This requires the CUDA toolkit (`nvcc` on `PATH`; headers under `CUDA_HOME`,
+default `/usr/local/cuda`). The build adds `-DFAISS_ENABLE_GPU=ON` to cmake
+and compiles the GPU NIF functions. Set `CUDAARCHS` (read by CMake) to build
+only for your GPU's compute capability — much faster than the default list:
 
-> **Note:** FAISS 1.12.0+ (including the pinned v1.15.1) requires **CUDA 12.x** — CUDA 11 support was dropped upstream. If you are stuck on CUDA 11, build with `FAISS_GIT_REV=v1.11.0`.
+```bash
+USE_CUDA=true CUDAARCHS=121 mix compile   # e.g. NVIDIA GB10 (DGX Spark)
+```
+
+Verified on a DGX Spark (GB10, aarch64, CUDA 13.0): full suite including
+`--include cuda` passes, and GPU search results match CPU.
+
+> **Note:** FAISS 1.12.0+ (including the pinned v1.15.1) requires **CUDA 12 or newer** — CUDA 11 support was dropped upstream. If you are stuck on CUDA 11, build with `FAISS_GIT_REV=v1.11.0`.
 
 ### Moving indexes to GPU
 
@@ -638,7 +648,8 @@ num_gpus = FaissEx.num_gpus()
 - GPU resources (`FaissStandardGpuResources`) must outlive GPU indexes. FaissEx handles this automatically — the `%FaissEx.Index{}` struct holds both the GPU resources ref and the index ref, so BEAM GC keeps both alive.
 - You can create indexes on CPU, add vectors, then move to GPU for fast search.
 - File I/O requires CPU indexes — move back with `gpu_to_cpu/1` before saving.
-- Concurrent reads (search) on the same GPU index are safe. Concurrent writes (add) are not.
+- Concurrent searches on the same GPU index run in parallel; `add`/`train`/`reset` serialize against them through the same per-index lock as on CPU.
+- Each `cpu_to_gpu/2` (and each `device: {:cuda, n}` index) gets its own FAISS GPU resources, which reserve GPU memory up front (~1.7 GB measured on a GB10). Create few GPU indexes per process.
 
 ### Running GPU tests
 

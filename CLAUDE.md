@@ -31,7 +31,9 @@ mix format           # Format code
 - `FAISS_PREFIX` env var: when set, uses system-installed FAISS instead of building from source
 - The pinned commit is re-checked on every `make` by the phony `verify-faiss` target (order-only prerequisite of the configure step and the NIF), so a tampered warm cache fails closed. `FAISS_GIT_REV`/`FAISS_GIT_REPO` are allow-listed with pure-make `strip_chars` (never pass them through `$(shell)` unvalidated); recipe paths are quoted
 - CMake ≥ 3.24 and (with `USE_CUDA=true`) nvcc ≥ 12 are checked inside the configure recipe
-- The macOS dev box has no CUDA: code inside `#ifdef FAISS_GPU_ENABLED` is compiled only by CI's `cuda-syntax` job (`nvidia/cuda:12.6.3-devel-ubuntu24.04`, `-fsyntax-only -Werror`). Reproduce locally with `docker run` on that image (see `.github/workflows/ci.yml`)
+- The macOS dev box has no CUDA: code inside `#ifdef FAISS_GPU_ENABLED` is compiled only by CI's `cuda-syntax` job (CUDA 12.6 container, `-fsyntax-only -Werror`). Reproduce locally with `docker run` on that image (see `.github/workflows/ci.yml`). Real GPU runs: DGX Spark at `10.0.20.26` (GB10, aarch64, CUDA 13.0) — build with `USE_CUDA=true CUDAARCHS=121`, OpenBLAS from `~/opt/openblas` via `CMAKE_PREFIX_PATH`
+- `USE_CUDA=true` adds `-I$(CUDA_HOME)/include` (default `/usr/local/cuda`) to the NIF compile — FAISS's GPU C API headers include `cuda_runtime_api.h`; without it no CUDA build compiled (fixed in v0.4.1)
+- Linux NIF link uses `-Wl,--no-as-needed` before `-lfaiss_c -lfaiss`: `libfaiss_c`'s RUNPATH points into the FAISS build dir in `~/.cache`, so without a direct `libfaiss.so` dependency (dropped by Ubuntu's default `--as-needed`) a release copied without the cache cannot load the NIF. CI's "NIF loads without the FAISS build cache" step guards this on every platform
 - `pull_request` CI has no base-branch filter so stacked PRs get checks; job names are not required checks (ruleset disabled), so renaming jobs is safe
 
 ## Architecture
