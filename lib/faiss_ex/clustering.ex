@@ -20,9 +20,9 @@ defmodule FaissEx.Clustering do
       # labels: [[cluster_id]]
   """
 
+  alias FaissEx.Index
   alias FaissEx.NIF
   alias FaissEx.Shared
-  alias FaissEx.Index
 
   defstruct [:ref, :k, :d, :index, :trained?]
 

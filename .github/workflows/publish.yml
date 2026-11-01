@@ -7,18 +7,23 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   ELIXIR_VERSION: "1.19"
-  OTP_VERSION: "28.0"
+  OTP_VERSION: "28"
 
 jobs:
   publish:
     name: Publish
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # HEX_API_KEY lives in this environment, which requires reviewer approval
+    environment: hex
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -26,26 +31,39 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake libopenblas-dev
 
+      # Same key format as ci.yml ("Compute FAISS cache key") on the same
+      # runner image, so a master CI run's FAISS build restores exactly.
+      # Restore only: a release must not write caches that CI later trusts.
+      - name: Compute FAISS cache key
+        id: key
+        env:
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+          MAKEFILE_HASH: ${{ hashFiles('Makefile') }}
+        run: |
+          FAISS_REV=$(sed -n 's/^FAISS_DEFAULT_REV *:= *//p' Makefile | tr -d ' ')
+          echo "faiss=${RUNNER_OS}-${RUNNER_ARCH}-${ImageOS}-faiss-${FAISS_REV}-${MAKEFILE_HASH}" >> "$GITHUB_OUTPUT"
+
       - name: Restore FAISS build cache
-        uses: actions/cache@v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/faiss_ex
-          key: publish-faiss-${{ hashFiles('Makefile') }}
-          # Must track the key CI writes (ci.yml "Compute cache keys"), which
-          # is now arch-qualified. This runner is Linux/amd64 -> Linux-X64-.
-          restore-keys: |
-            Linux-X64-faiss-
+          key: ${{ steps.key.outputs.faiss }}
 
       - name: Set version from tag
         run: |
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          if ! printf '%s' "$TAG_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::tag version '$TAG_VERSION' is not MAJOR.MINOR.PATCH[-PRE]"
+            exit 1
+          fi
           sed -i "s/@version \".*\"/@version \"${TAG_VERSION}\"/" mix.exs
           grep '@version' mix.exs
 
       # ---- Release gate -------------------------------------------------
-      # A tag can point at any commit, and CI only runs on pushes/PRs to
-      # master, so without this the tag itself is unverified. FAISS is shared
-      # via ~/.cache/faiss_ex, so the test build only recompiles the NIF.
+      # A tag can point at any commit, and CI only runs on pushes to master
+      # and on PRs, so without this the tag itself is unverified. FAISS is
+      # shared via ~/.cache/faiss_ex, so the test build only recompiles the NIF.
       - name: Check formatting
         run: mix format --check-formatted
 
@@ -58,6 +76,11 @@ jobs:
       # -------------------------------------------------------------------
 
       - run: mix deps.get
+        env:
+          MIX_ENV: dev
+
+      - name: Audit Hex dependencies
+        run: mix hex.audit
         env:
           MIX_ENV: dev
 

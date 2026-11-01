@@ -16,8 +16,8 @@ Binds to FAISS via its official C API (`libfaiss_c`). No external dependencies b
 
 ## Prerequisites
 
-- Erlang/OTP 27+ with NIF support
-- Elixir 1.18+
+- Elixir 1.18+ on Erlang/OTP 27+ with NIF support (the CI-tested floor; CI also
+  tests Elixir 1.19/OTP 28 and Elixir 1.20/OTP 29)
 - A C11 compiler for the NIF and a C++20 compiler for FAISS (GCC 10+, Clang 12+, or AppleClang 14+)
 - **Either** a system FAISS installation **or** CMake 3.24+ to build from source (the default; the build checks the version before configuring)
 

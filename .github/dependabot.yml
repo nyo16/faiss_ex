@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # Actions are pinned by commit SHA; Dependabot bumps the SHA and the
+  # trailing "# vX.Y.Z" comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Let a new release age a week before proposing it (supply-chain buffer)
+    cooldown:
+      default-days: 7
