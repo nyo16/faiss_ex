@@ -31,7 +31,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake libopenblas-dev
 
       # RUNNER_ARCH is part of both keys: a FAISS build is native machine
-      # code, and macos-15-intel (X64) / macos-14 (ARM64) both report runner.os
+      # code, and macos-15-intel (X64) / macos-15 (ARM64) both report runner.os
       # "macOS". Keyed on the OS alone they would share — and poison — one
       # cache entry with wrong-architecture binaries.
       - name: Compute cache keys
@@ -118,7 +118,7 @@ jobs:
   #
   # macOS is the important one: the Makefile has a large darwin-only path
   # (install_name_tool @rpath/@loader_path rewriting, libomp discovery,
-  # FAISS_ENABLE_MKL=OFF) that no job exercised. macos-14 is Apple Silicon,
+  # FAISS_ENABLE_MKL=OFF) that no job exercised. macos-15 is Apple Silicon,
   # macos-15-intel is Intel — both matter, because the two differ in Homebrew
   # prefix and in whether Accelerate or OpenBLAS backs BLAS.
   #
@@ -132,7 +132,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: macos-14, label: macOS arm64 }
+          - { runner: macos-15, label: macOS arm64 }
           - { runner: macos-15-intel, label: macOS amd64 }
           - { runner: ubuntu-22.04-arm, label: Linux arm64 }
     steps:
