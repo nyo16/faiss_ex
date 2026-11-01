@@ -316,10 +316,10 @@ defmodule FaissEx.Index do
 
   Accepts the same list or binary vector forms as `add/2`.
 
-  An empty training set goes to FAISS, which decides: indexes that need no
-  training (`"Flat"`, `"HNSW32"`) return `:ok`, while indexes that do
-  (`"IVF4,Flat"`, `"PQ8"`) return `{:error, reason}` — k-means needs at
-  least as many points as clusters.
+  An empty training set never reaches FAISS (some trainers hand it to BLAS,
+  which can exit the process): it returns `:ok` for an index that is already
+  trained (`"Flat"`, `"HNSW32"`) and `{:error, "no training vectors"}` for
+  one that is not (`"IVF4,Flat"`, `"PQ8"`, `"PCA8,Flat"`).
   """
   @spec train(t(), vector_data()) :: :ok | error()
   def train(%__MODULE__{ref: ref, dim: dim}, data) when is_list(data) or is_binary(data) do
@@ -349,8 +349,10 @@ defmodule FaissEx.Index do
   Reconstructs vectors at the given keys.
 
   `keys` is a list of integer indices. Returns `{:ok, [[float]]}` with shape
-  n * dim, or `{:error, "key out of range"}` for a negative key or a
-  contiguous range that cannot address any index.
+  n * dim. Returns `{:error, "key out of range"}` for a negative key, a key
+  of `2**63 - 1`, or a key range with no stored vector. A key at or past
+  `ntotal`, or an index type that cannot reconstruct (e.g. `"IDMap,Flat"`;
+  use `"IDMap2,Flat"`), returns FAISS's own error.
   """
   @spec reconstruct(t(), [integer()]) :: {:ok, [[float()]]} | error()
   def reconstruct(%__MODULE__{ref: ref, dim: dim}, keys) when is_list(keys) do
@@ -368,7 +370,7 @@ defmodule FaissEx.Index do
   `keys` is a list of integers or an `s64-native` binary. Returns
   `{:ok, binary}` where the binary is `n * dim` `f32-native` floats,
   row-major — useful for bulk export without decode-then-chunk overhead.
-  Returns `{:error, "key out of range"}` for a negative key.
+  Errors are the same as for `reconstruct/2`.
   """
   @spec reconstruct_binary(t(), id_data()) :: {:ok, binary()} | error()
   def reconstruct_binary(%__MODULE__{ref: ref}, keys)
@@ -381,8 +383,8 @@ defmodule FaissEx.Index do
   Computes residuals: `xs - reconstruct(keys)`.
 
   `xs` accepts the same list or binary forms as `add/2`, `keys` a list of
-  integers or an `s64-native` binary. Returns `{:ok, [[float]]}`, or
-  `{:error, "key out of range"}` for a negative key.
+  integers or an `s64-native` binary. Returns `{:ok, [[float]]}`; errors for
+  bad keys are the same as for `reconstruct/2`.
 
   Raises `ArgumentError` if a vector does not have `dim` elements, if a key
   is not an integer, or if the key count does not match the vector count.
@@ -432,33 +434,48 @@ defmodule FaissEx.Index do
 
   ## Options
 
-    * `:io_flags` - FAISS IO flags, a bitwise OR of the values below
-      (default `0`). Unknown options raise `ArgumentError`.
+    * `:io_flags` - FAISS IO flags (default `0`): `0`, or a bitwise OR of
+      the values below. Any other value, and unknown options, raise
+      `ArgumentError`.
 
   | Flag | Value | Effect |
   |------|-------|--------|
   | `IO_FLAG_READ_ONLY` | `2` | Open on-disk inverted lists read-only |
   | `IO_FLAG_ONDISK_SAME_DIR` | `4` | Resolve on-disk inverted-list files in the index file's directory, ignoring the stored path |
-  | `IO_FLAG_SKIP_IVF_DATA` | `8` | Load an IVF index's structure without its inverted lists |
+
+  Other FAISS flags (for example `IO_FLAG_SKIP_IVF_DATA`, `8`) are
+  rejected: they produce index objects whose later use can dereference
+  memory FAISS never mapped.
 
   ## Trust boundary
 
-  Only load files you trust with the default flags. An index file can
-  describe an on-disk IVF index (`OnDiskInvertedLists`) whose inverted
-  lists live in a *separate* file named by a path stored inside the index
-  file. Loading it memory-maps that path — read-write unless
-  `IO_FLAG_READ_ONLY` is set — so a crafted file can make this process
-  map, read, and modify an arbitrary file it has access to.
+  **Only load index files you trust.** FAISS's file reader is a parser of
+  untrusted binary input with limited validation:
 
-  For files from an untrusted source, pass `io_flags: 6`
-  (`IO_FLAG_READ_ONLY ||| IO_FLAG_ONDISK_SAME_DIR`): the stored path is
-  replaced by the index file's own directory and the mapping is read-only.
-  `IO_FLAG_READ_ONLY` alone is not enough — it still maps whatever path
-  the file names, read-only.
+    * An index file can describe an on-disk IVF index
+      (`OnDiskInvertedLists`) whose inverted lists live in a *separate*
+      file named by a path stored inside the index file. Loading it
+      memory-maps that path — read-write unless `IO_FLAG_READ_ONLY` is set —
+      so a crafted file can make this process map, read, and modify an
+      arbitrary file it has access to.
+    * Lengths and offsets inside the file are not all bounds-checked, so a
+      crafted file can still crash the VM or read memory it should not.
+
+  `io_flags: 6` (`IO_FLAG_READ_ONLY ||| IO_FLAG_ONDISK_SAME_DIR`) narrows the
+  first problem — the stored path is replaced by the index file's own
+  directory and the mapping is read-only — but does not make an untrusted
+  file safe. Prefer it whenever on-disk IVF indexes are involved;
+  `IO_FLAG_READ_ONLY` alone still maps whatever path the file names.
   """
   @spec from_file(String.t(), keyword()) :: {:ok, t()} | error()
   def from_file(path, opts \\ []) do
     io_flags = opts |> Keyword.validate!(io_flags: 0) |> Keyword.fetch!(:io_flags)
+
+    unless io_flags in [0, 2, 4, 6] do
+      raise ArgumentError,
+            "invalid io_flags #{inspect(io_flags)}, expected 0, 2 (read-only), " <>
+              "4 (on-disk same dir), or 6"
+    end
 
     with {:ok, ref} <- NIF.nif_read_index(path, io_flags) do
       # Hard match on purpose: we just opened this index, so a failure here

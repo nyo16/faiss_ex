@@ -126,6 +126,16 @@ else
 
   ifeq ($(FAISS_GIT_SHA),)
     $(warning FAISS_GIT_SHA is empty: FAISS $(FAISS_GIT_REV) builds without commit verification)
+  else
+    ifneq ($(words $(FAISS_GIT_SHA)),1)
+      $(error FAISS_GIT_SHA must be a 40-character hex commit id)
+    endif
+    ifneq ($(call strip_chars,$(FAISS_GIT_SHA),0 1 2 3 4 5 6 7 8 9 a b c d e f),)
+      $(error FAISS_GIT_SHA must be a 40-character hex commit id)
+    endif
+    ifneq ($(words $(subst 0, 0 ,$(subst 1, 1 ,$(subst 2, 2 ,$(subst 3, 3 ,$(subst 4, 4 ,$(subst 5, 5 ,$(subst 6, 6 ,$(subst 7, 7 ,$(subst 8, 8 ,$(subst 9, 9 ,$(subst a, a ,$(subst b, b ,$(subst c, c ,$(subst d, d ,$(subst e, e ,$(subst f, f ,$(FAISS_GIT_SHA)))))))))))))))))),40)
+      $(error FAISS_GIT_SHA must be a 40-character hex commit id)
+    endif
   endif
 endif
 
@@ -156,6 +166,12 @@ ifeq ($(origin LIBOMP_PREFIX),undefined)
   LIBOMP_PREFIX := $(shell brew --prefix libomp 2>/dev/null)
 endif
 
+# `brew --prefix libomp` prints the keg path even when libomp is not
+# installed, so require the library itself to exist.
+ifeq ($(wildcard $(LIBOMP_PREFIX)/lib/libomp.dylib),)
+  LIBOMP_PREFIX :=
+endif
+
 ifeq ($(LIBOMP_PREFIX),)
   $(warning libomp not found: install it with `brew install libomp`, or set LIBOMP_PREFIX. FAISS configure will fail without OpenMP.)
 else
@@ -168,19 +184,23 @@ endif
 
 # OpenMP for the NIF itself (FaissEx.set_omp_threads/1 calls
 # omp_set_num_threads). The NIF must link the *same* runtime libfaiss uses:
-# two OpenMP runtimes in one process hang or crash. On macOS that is the
-# LIBOMP_PREFIX libomp FAISS was configured with; on Linux, -fopenmp with
-# the default cc (GCC) gives libgomp, which the default g++ build of FAISS
-# links too. A system FAISS linked against Intel's libiomp5, or a macOS
-# build without libomp, gets FAISS_EX_NO_OMP: the setting is accepted and
-# ignored.
+# two OpenMP runtimes in one process hang or abort (LLVM libomp: "OMP:
+# Error #15"), or the setting silently misses FAISS's runtime. On macOS
+# that is the LIBOMP_PREFIX libomp FAISS was configured with; on Linux,
+# -fopenmp with the default cc (GCC) gives libgomp, which the default g++
+# build of FAISS links too. A system FAISS (FAISS_PREFIX) must be shown to
+# link exactly that runtime; anything else (Intel libiomp5, MacPorts or
+# clang libomp, no OpenMP) — and macOS without libomp — gets
+# FAISS_EX_NO_OMP: the NIF links no OpenMP and the setting is ignored.
 ifdef FAISS_PREFIX
   ifeq ($(UNAME_S),Darwin)
     FAISS_LINKED_LIBS := $(shell otool -L "$(SYSTEM_LIB_DIR)/libfaiss.dylib" 2>/dev/null)
+    NIF_OMP_RUNTIME := $(LIBOMP_PREFIX)/lib/libomp.dylib
   else
     FAISS_LINKED_LIBS := $(shell readelf -d "$(SYSTEM_LIB_DIR)/libfaiss.so" 2>/dev/null)
+    NIF_OMP_RUNTIME := [libgomp.so
   endif
-  ifneq ($(findstring iomp5,$(FAISS_LINKED_LIBS)),)
+  ifeq ($(findstring $(NIF_OMP_RUNTIME),$(FAISS_LINKED_LIBS)),)
     NIF_OMP_DISABLED := true
   endif
 endif
@@ -251,9 +271,11 @@ $(NIF_SO): c_src/faiss_ex_nif.c $(LIB_DIR)/libfaiss_c.$(SHARED_EXT) $(LIB_DIR)/l
 else
 # ========== Build from source path ==========
 
-# Fails when the clone's HEAD is not FAISS_GIT_SHA. Run after cloning and,
-# through the verify-faiss target, on every make, so a warm cache whose
-# source tree no longer matches the pin also fails closed.
+# Fails when the clone's HEAD commit is not FAISS_GIT_SHA. Run after
+# cloning and, through the verify-faiss target, on every make, so a warm
+# cache checked out at a different commit fails closed. It checks the
+# commit only, not the working tree: local edits to cached sources are not
+# detected.
 verify_faiss_sha = actual=$$(git -C "$(FAISS_SRC)" rev-parse HEAD) || exit 1; \
   if [ "$$actual" != "$(FAISS_GIT_SHA)" ]; then \
     echo "ERROR: FAISS $(FAISS_GIT_REV) resolved to commit $$actual"; \

@@ -253,18 +253,21 @@ ids = Enum.to_list(1000..1099)
 {:ok, loaded} = FaissEx.Index.from_file("/tmp/my_index.faiss")
 ```
 
-> **Only load index files you trust.** An index file can describe an on-disk
-> IVF index whose inverted lists live at a path stored *inside* the file;
-> loading it memory-maps that path (read-write by default), so a crafted file
-> can read and modify any file the BEAM process can open. For untrusted files
-> pass `io_flags: 6` (read-only, and inverted lists resolved next to the index
-> file instead of at the stored path):
+> **Only load index files you trust.** FAISS's file reader does limited
+> validation of the binary input. An index file can describe an on-disk IVF
+> index whose inverted lists live at a path stored *inside* the file; loading
+> it memory-maps that path (read-write by default), so a crafted file can read
+> and modify any file the BEAM process can open — and malformed lengths can
+> still crash the VM. When on-disk IVF indexes are involved, pass
+> `io_flags: 6` (read-only, and inverted lists resolved next to the index
+> file instead of at the stored path); it narrows the risk but does not make
+> an untrusted file safe:
 >
 > ```elixir
 > {:ok, loaded} = FaissEx.Index.from_file(path, io_flags: 6)
 > ```
 >
-> See `FaissEx.Index.from_file/2` for the flag table.
+> `:io_flags` accepts `0`, `2`, `4`, or `6`; see `FaissEx.Index.from_file/2`.
 
 ### Cloning and resetting
 
@@ -493,10 +496,12 @@ concurrent callers then multiply those teams across the dirty schedulers and
 oversubscribe the CPU. Set the thread count per workload:
 
 ```elixir
-# config/runtime.exs — many concurrent small requests
+# config/config.exs (or prod.exs) — many concurrent small requests.
+# Not runtime.exs: the value is read when the NIF loads, which in a release
+# happens before runtime.exs runs.
 config :faiss_ex, omp_threads: 1
 
-# or at runtime; 0 restores the default
+# or at runtime (e.g. in your Application.start/2); 0 restores the default
 FaissEx.set_omp_threads(1)
 ```
 
