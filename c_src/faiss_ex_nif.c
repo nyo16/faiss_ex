@@ -141,7 +141,7 @@ static ERL_NIF_TERM make_error_msg(ErlNifEnv *env, const char *msg) {
 
 static ERL_NIF_TERM make_faiss_error(ErlNifEnv *env, const char *fallback) {
     /* Relies on faiss_get_last_error() being thread-local (verified for
-     * v1.14.3: c_api/error_impl.cpp) so concurrent NIF calls on different
+     * v1.15.1: c_api/error_impl.cpp) so concurrent NIF calls on different
      * dirty-scheduler threads cannot cross-contaminate error messages.
      * Re-verify when bumping FAISS_GIT_REV. */
     const char *err = faiss_get_last_error();
@@ -178,8 +178,9 @@ static char *dup_cstr(const ErlNifBinary *bin) {
 /* Rejects reconstruction keys that FAISS will not bounds-check.
  * IndexFlat::reconstruct tests only `key < ntotal`, which every negative key
  * passes, so a negative key reads before the codes array and returns heap
- * contents as vector data. Verified against v1.14.3: reconstruct([-1, -5])
- * yields garbage floats with no error. The upper bound stays FAISS's job --
+ * contents as vector data. Verified against v1.14.3 (reconstruct([-1, -5])
+ * yields garbage floats with no error); the check is unchanged in v1.15.1.
+ * The upper bound stays FAISS's job --
  * it needs ntotal, which needs the lock. */
 static int keys_non_negative(const idx_t *keys, ErlNifSInt64 n) {
     for (ErlNifSInt64 i = 0; i < n; i++) {

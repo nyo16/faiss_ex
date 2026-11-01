@@ -1,13 +1,13 @@
 defmodule FaissEx.MixProject do
   use Mix.Project
 
-  @version "0.3.1"
+  @version "0.3.2"
   @source_url "https://github.com/nyo16/faiss_ex"
 
   # Keep rev+SHA in sync with Makefile. The SHA is what the tag must resolve
   # to post-clone — tags are mutable refs, the commit is the real pin.
-  @faiss_git_rev "v1.14.3"
-  @faiss_git_sha "0ca9df4792b173d573044ee14ca0704780176e82"
+  @faiss_git_rev "v1.15.1"
+  @faiss_git_sha "75c755c5a1fc854756aaf3bd1131213aeb21d8d1"
 
   def project do
     [

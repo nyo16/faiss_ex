@@ -123,7 +123,7 @@ FAISS_PREFIX=/opt/faiss mix compile
 | `FAISS_OPT_LEVEL` | `generic` | SIMD optimization level (see below). Only used when building from source |
 | `USE_CUDA` | `false` | Set to `true` to enable GPU support |
 | `FAISS_GIT_REPO` | `https://github.com/facebookresearch/faiss.git` | FAISS git repository (ignored when `FAISS_PREFIX` is set) |
-| `FAISS_GIT_REV` | `v1.14.3` | FAISS version tag or commit (ignored when `FAISS_PREFIX` is set) |
+| `FAISS_GIT_REV` | `v1.15.1` | FAISS version tag or commit (ignored when `FAISS_PREFIX` is set) |
 
 ### SIMD optimization
 
@@ -530,7 +530,7 @@ USE_CUDA=true mix compile
 
 This requires the CUDA toolkit to be installed. The build adds `-DFAISS_ENABLE_GPU=ON` to cmake and compiles GPU-specific NIF functions.
 
-> **Note:** FAISS 1.12.0+ (including the pinned v1.14.3) requires **CUDA 12.x** — CUDA 11 support was dropped upstream. If you are stuck on CUDA 11, build with `FAISS_GIT_REV=v1.11.0`.
+> **Note:** FAISS 1.12.0+ (including the pinned v1.15.1) requires **CUDA 12.x** — CUDA 11 support was dropped upstream. If you are stuck on CUDA 11, build with `FAISS_GIT_REV=v1.11.0`.
 
 ### Moving indexes to GPU
 

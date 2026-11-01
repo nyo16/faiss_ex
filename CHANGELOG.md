@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.2 (2026-10-31)
+
+### Changed
+
+- **Pinned FAISS upgraded from v1.14.3 to v1.15.1** (commit
+  `75c755c5a1fc854756aaf3bd1131213aeb21d8d1`). Upstream C API changes are
+  additive only (new ScalarQuantizer, BinaryIVF, and DirectMap entry points);
+  nothing this library calls changed. Existing saved indexes load unchanged.
+  GPU builds still require CUDA 12.x.
+
 ## v0.3.1 (2026-08-07)
 
 Lock-discipline hardening and API consistency. No new features.

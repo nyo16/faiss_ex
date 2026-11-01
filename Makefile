@@ -11,13 +11,13 @@
 #   MIX_APP_PATH   - set by elixir_make
 
 FAISS_GIT_REPO ?= https://github.com/facebookresearch/faiss.git
-FAISS_GIT_REV  ?= v1.14.3
+FAISS_GIT_REV  ?= v1.15.1
 # Tags are mutable refs — verify the clone resolves to the expected commit.
 # The default SHA only applies to the default rev; a custom FAISS_GIT_REV
 # builds unverified unless FAISS_GIT_SHA is provided alongside it.
 # Keep rev+SHA in sync with mix.exs (make_env/0).
-ifeq ($(FAISS_GIT_REV),v1.14.3)
-FAISS_GIT_SHA ?= 0ca9df4792b173d573044ee14ca0704780176e82
+ifeq ($(FAISS_GIT_REV),v1.15.1)
+FAISS_GIT_SHA ?= 75c755c5a1fc854756aaf3bd1131213aeb21d8d1
 endif
 FAISS_GIT_SHA ?=
 USE_CUDA       ?= false
