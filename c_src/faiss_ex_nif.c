@@ -85,6 +85,13 @@ typedef struct {
      * not exposed), so reads need no lock. Re-verify when bumping
      * FAISS_GIT_REV. */
     int dim;
+    /* Set for GPU indexes, immutable after wrap. FAISS GPU resources
+     * (StandardGpuResources' temporary-memory stack and stream) are not
+     * thread-safe: two concurrent searches on one GPU index trip
+     * `p + size == head_` in StackDeviceMemory and abort the process
+     * (verified on a GB10, v1.15.1). Every operation on an exclusive index
+     * therefore takes the write lock. */
+    int exclusive;
 } IndexResource;
 
 typedef struct {
@@ -253,6 +260,20 @@ static int acquire_write(ErlNifRWLock *lock, LockMode mode) {
     return enif_rwlock_tryrwlock(lock) == 0;
 }
 
+/* Shared access to an index: the read lock, or the write lock for an
+ * exclusive (GPU) index. Pair every acquire with release_index_read. */
+static int acquire_index_read(IndexResource *res, LockMode mode) {
+    return res->exclusive ? acquire_write(res->lock, mode) : acquire_read(res->lock, mode);
+}
+
+static void release_index_read(IndexResource *res) {
+    if (res->exclusive) {
+        enif_rwlock_rwunlock(res->lock);
+    } else {
+        enif_rwlock_runlock(res->lock);
+    }
+}
+
 /* Declares name##_impl and defines the two entries described in the
  * header comment: `name` (registered dirty CPU, LOCK_TRY) and `name##_io`
  * (dirty IO, LOCK_BLOCK). */
@@ -348,7 +369,8 @@ static const uint32_t UNWRITTEN_ROW_TAG = 0x7FA5A5A5u;
 
 /* Wraps a FaissIndex in a resource with its own rwlock.
  * Takes ownership: frees the index and returns 0 on failure. */
-static int wrap_index_resource(ErlNifEnv *env, FaissIndex *index, ERL_NIF_TERM *ref_out) {
+static int wrap_index_resource(ErlNifEnv *env, FaissIndex *index, int exclusive,
+                               ERL_NIF_TERM *ref_out) {
     ErlNifRWLock *lock = enif_rwlock_create("faiss_ex_index");
     if (!lock) {
         faiss_Index_free(index);
@@ -364,6 +386,7 @@ static int wrap_index_resource(ErlNifEnv *env, FaissIndex *index, ERL_NIF_TERM *
     res->index = index;
     res->lock = lock;
     res->dim = faiss_Index_d(index);
+    res->exclusive = exclusive;
     *ref_out = enif_make_resource(env, res);
     enif_release_resource(res);
     return 1;
@@ -407,7 +430,7 @@ static ERL_NIF_TERM nif_new_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     }
 
     ERL_NIF_TERM ref;
-    if (!wrap_index_resource(env, index, &ref)) {
+    if (!wrap_index_resource(env, index, 0, &ref)) {
         return make_error_msg(env, "failed to allocate resource");
     }
 
@@ -424,17 +447,17 @@ static ERL_NIF_TERM nif_clone_index_impl(ErlNifEnv *env, int argc, const ERL_NIF
     }
 
     FaissIndex *cloned = NULL;
-    if (!acquire_read(res->lock, mode)) {
+    if (!acquire_index_read(res, mode)) {
         return RESCHEDULE_BLOCKING(nif_clone_index, env, argc, argv);
     }
     int ret = faiss_clone_index(res->index, &cloned);
-    enif_rwlock_runlock(res->lock);
+    release_index_read(res);
     if (ret != 0) {
         return make_faiss_error(env, "failed to clone index");
     }
 
     ERL_NIF_TERM ref;
-    if (!wrap_index_resource(env, cloned, &ref)) {
+    if (!wrap_index_resource(env, cloned, res->exclusive, &ref)) {
         return make_error_msg(env, "failed to allocate resource");
     }
 
@@ -579,7 +602,7 @@ static ERL_NIF_TERM nif_search_index_impl(ErlNifEnv *env, int argc, const ERL_NI
     }
 
     apply_omp_threads();
-    if (!acquire_read(res->lock, mode)) {
+    if (!acquire_index_read(res, mode)) {
         free_owned(owned);
         enif_release_binary(&distances_bin);
         enif_release_binary(&labels_bin);
@@ -587,7 +610,7 @@ static ERL_NIF_TERM nif_search_index_impl(ErlNifEnv *env, int argc, const ERL_NI
     }
     int ret = faiss_Index_search(res->index, (idx_t)n, (const float *)data, (idx_t)k,
                                  (float *)distances_bin.data, (idx_t *)labels_bin.data);
-    enif_rwlock_runlock(res->lock);
+    release_index_read(res);
     free_owned(owned);
 
     if (ret != 0) {
@@ -628,11 +651,11 @@ static ERL_NIF_TERM nif_train_index_impl(ErlNifEnv *env, int argc, const ERL_NIF
     if (err) return make_error_msg(env, err);
 
     if (n == 0) {
-        if (!acquire_read(res->lock, mode)) {
+        if (!acquire_index_read(res, mode)) {
             return RESCHEDULE_BLOCKING(nif_train_index, env, argc, argv);
         }
         int trained = faiss_Index_is_trained(res->index);
-        enif_rwlock_runlock(res->lock);
+        release_index_read(res);
         return trained ? atom_ok : make_error_msg(env, "no training vectors");
     }
 
@@ -759,7 +782,7 @@ static ERL_NIF_TERM nif_reconstruct_batch_impl(ErlNifEnv *env, int argc, const E
     }
 
     apply_omp_threads();
-    if (!acquire_read(res->lock, mode)) {
+    if (!acquire_index_read(res, mode)) {
         free_owned(owned);
         enif_release_binary(&result_bin);
         return RESCHEDULE_BLOCKING(nif_reconstruct_batch, env, argc, argv);
@@ -775,7 +798,7 @@ static ERL_NIF_TERM nif_reconstruct_batch_impl(ErlNifEnv *env, int argc, const E
             if (ret != 0) break;
         }
     }
-    enif_rwlock_runlock(res->lock);
+    release_index_read(res);
     free_owned(owned);
 
     if (ret != 0) {
@@ -845,7 +868,7 @@ static ERL_NIF_TERM nif_compute_residuals_impl(ErlNifEnv *env, int argc, const E
     }
 
     apply_omp_threads();
-    if (!acquire_read(res->lock, mode)) {
+    if (!acquire_index_read(res, mode)) {
         free_owned(owned_data);
         free_owned(owned_keys);
         enif_release_binary(&result_bin);
@@ -862,7 +885,7 @@ static ERL_NIF_TERM nif_compute_residuals_impl(ErlNifEnv *env, int argc, const E
         ret = faiss_Index_compute_residual(res->index, xs + i * dim, residuals + i * dim, keys[i]);
         if (ret != 0) break;
     }
-    enif_rwlock_runlock(res->lock);
+    release_index_read(res);
     free_owned(owned_data);
     free_owned(owned_keys);
 
@@ -890,9 +913,9 @@ static ERL_NIF_TERM nif_write_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     char *path = dup_cstr(&path_bin);
     if (!path) return make_error_msg(env, "out of memory");
 
-    enif_rwlock_rlock(res->lock);
+    acquire_index_read(res, LOCK_BLOCK);
     int ret = faiss_write_index_fname(res->index, path);
-    enif_rwlock_runlock(res->lock);
+    release_index_read(res);
     enif_free(path);
 
     if (ret != 0) {
@@ -935,7 +958,7 @@ static ERL_NIF_TERM nif_read_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     }
 
     ERL_NIF_TERM ref;
-    if (!wrap_index_resource(env, index, &ref)) {
+    if (!wrap_index_resource(env, index, 0, &ref)) {
         return make_error_msg(env, "failed to allocate resource");
     }
 
@@ -960,9 +983,9 @@ static ERL_NIF_TERM nif_get_index_ntotal(ErlNifEnv *env, int argc, const ERL_NIF
     if (!enif_get_resource(env, argv[0], INDEX_RESOURCE_TYPE, (void **)&res)) {
         return make_error_msg(env, "invalid index reference");
     }
-    enif_rwlock_rlock(res->lock);
+    acquire_index_read(res, LOCK_BLOCK);
     int64_t ntotal = (int64_t)faiss_Index_ntotal(res->index);
-    enif_rwlock_runlock(res->lock);
+    release_index_read(res);
     return make_ok(env, enif_make_int64(env, ntotal));
 }
 
@@ -973,9 +996,9 @@ static ERL_NIF_TERM nif_get_index_is_trained(ErlNifEnv *env, int argc, const ERL
     if (!enif_get_resource(env, argv[0], INDEX_RESOURCE_TYPE, (void **)&res)) {
         return make_error_msg(env, "invalid index reference");
     }
-    enif_rwlock_rlock(res->lock);
+    acquire_index_read(res, LOCK_BLOCK);
     int trained = faiss_Index_is_trained(res->index);
-    enif_rwlock_runlock(res->lock);
+    release_index_read(res);
     return make_ok(env, trained ? atom_true : atom_false);
 }
 
@@ -1004,9 +1027,9 @@ static ERL_NIF_TERM nif_index_cpu_to_gpu(ErlNifEnv *env, int argc, const ERL_NIF
     }
 
     FaissIndex *gpu_index = NULL;
-    enif_rwlock_rlock(res->lock);
+    acquire_index_read(res, LOCK_BLOCK);
     ret = faiss_index_cpu_to_gpu((FaissGpuResourcesProvider *)gpu_res, device, res->index, &gpu_index);
-    enif_rwlock_runlock(res->lock);
+    release_index_read(res);
     if (ret != 0) {
         faiss_StandardGpuResources_free(gpu_res);
         return make_faiss_error(env, "failed to move index to GPU");
@@ -1025,7 +1048,7 @@ static ERL_NIF_TERM nif_index_cpu_to_gpu(ErlNifEnv *env, int argc, const ERL_NIF
 
     /* gpu_res is owned by gpu_res_resource; env cleanup frees it on failure */
     ERL_NIF_TERM gpu_idx_ref;
-    if (!wrap_index_resource(env, gpu_index, &gpu_idx_ref)) {
+    if (!wrap_index_resource(env, gpu_index, 1, &gpu_idx_ref)) {
         return make_error_msg(env, "failed to allocate resource");
     }
 
@@ -1041,15 +1064,15 @@ static ERL_NIF_TERM nif_index_gpu_to_cpu(ErlNifEnv *env, int argc, const ERL_NIF
     }
 
     FaissIndex *cpu_index = NULL;
-    enif_rwlock_rlock(res->lock);
+    acquire_index_read(res, LOCK_BLOCK);
     int ret = faiss_index_gpu_to_cpu(res->index, &cpu_index);
-    enif_rwlock_runlock(res->lock);
+    release_index_read(res);
     if (ret != 0) {
         return make_faiss_error(env, "failed to move index to CPU");
     }
 
     ERL_NIF_TERM ref;
-    if (!wrap_index_resource(env, cpu_index, &ref)) {
+    if (!wrap_index_resource(env, cpu_index, 0, &ref)) {
         return make_error_msg(env, "failed to allocate resource");
     }
 

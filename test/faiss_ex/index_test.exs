@@ -214,6 +214,33 @@ defmodule FaissEx.IndexTest do
       assert cpu_index.device == :host
       assert {:ok, 1} = Index.ntotal(cpu_index)
     end
+
+    @tag :cuda
+    test "concurrent searches on one GPU index do not abort the VM" do
+      # FAISS GPU resources are not thread-safe; parallel searches on one GPU
+      # index tripped a StackDeviceMemory assertion and aborted the process.
+      dim = 32
+
+      data =
+        for i <- 0..19_999,
+            into: <<>>,
+            do: <<rem(i, 97) * 1.0::float-32-native, 0::size(31 * 32)>>
+
+      {:ok, gpu} = Index.new(dim, "Flat", device: {:cuda, 0})
+      :ok = Index.add(gpu, data)
+      query = binary_part(data, 0, dim * 4)
+
+      results =
+        1..16
+        |> Enum.map(fn _ ->
+          Task.async(fn -> for _ <- 1..50, do: Index.search_binary(gpu, query, 5) end)
+        end)
+        |> Task.await_many(120_000)
+        |> List.flatten()
+
+      assert length(results) == 800
+      assert Enum.all?(results, &match?({:ok, %{n: 1}}, &1))
+    end
   end
 
   describe "compute_residuals/3" do
