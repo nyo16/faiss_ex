@@ -253,6 +253,19 @@ ids = Enum.to_list(1000..1099)
 {:ok, loaded} = FaissEx.Index.from_file("/tmp/my_index.faiss")
 ```
 
+> **Only load index files you trust.** An index file can describe an on-disk
+> IVF index whose inverted lists live at a path stored *inside* the file;
+> loading it memory-maps that path (read-write by default), so a crafted file
+> can read and modify any file the BEAM process can open. For untrusted files
+> pass `io_flags: 6` (read-only, and inverted lists resolved next to the index
+> file instead of at the stored path):
+>
+> ```elixir
+> {:ok, loaded} = FaissEx.Index.from_file(path, io_flags: 6)
+> ```
+>
+> See `FaissEx.Index.from_file/2` for the flag table.
+
 ### Cloning and resetting
 
 ```elixir
@@ -319,16 +332,19 @@ embeddings_bin = Base.decode64!(response.body["embedding_b64"])
 :ok = FaissEx.Index.add(index, embeddings_bin)   # n inferred from byte_size
 ```
 
-`add/2`, `train/2`, and `add_with_ids/3` accept binaries anywhere they accept
-lists (IDs/keys are `s64-native`; mixing forms is fine). For zero-decode
-results, opt in with the `_binary` variants — the list-returning functions
-never change shape based on input type:
+`add/2`, `add_with_ids/3`, `train/2`, `search/3`, `compute_residuals/3`, and
+`FaissEx.Clustering.train/2` / `get_cluster_assignment/2` accept binaries
+anywhere they accept lists (IDs/keys are `s64-native`; mixing forms is fine).
+For zero-decode results, opt in with the `_binary` variants — the
+list-returning functions never change shape based on input type:
 
 ```elixir
 {:ok, %{n: n, distances: dist_bin, labels: labels_bin}} =
   FaissEx.Index.search_binary(index, queries_bin, 10)
 
 {:ok, vectors_bin} = FaissEx.Index.reconstruct_binary(index, ids_bin)
+{:ok, residuals_bin} = FaissEx.Index.compute_residuals_binary(index, xs_bin, ids_bin)
+{:ok, centroids_bin} = FaissEx.Clustering.get_centroids_binary(trained)
 
 # Decode when needed
 labels = for <<i::signed-native-64 <- labels_bin>>, do: i

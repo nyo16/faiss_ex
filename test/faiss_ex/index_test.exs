@@ -74,8 +74,7 @@ defmodule FaissEx.IndexTest do
       {:ok, %{labels: labels}} =
         Index.search(index, [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], 1)
 
-      assert [[0]] = Enum.take(labels, 1)
-      assert [_, [2]] = labels
+      assert [[0], [2]] = labels
     end
   end
 
@@ -291,7 +290,7 @@ defmodule FaissEx.IndexTest do
       {:ok, index} = Index.new(8, "HNSW32")
       assert {:ok, true} = Index.trained?(index)
 
-      vectors = for _ <- 1..100, do: for(_ <- 1..8, do: :rand.uniform())
+      vectors = for i <- 0..99, do: List.duplicate(i * 1.0, 8)
       :ok = Index.add(index, vectors)
 
       assert {:ok, 100} = Index.ntotal(index)
@@ -325,11 +324,45 @@ defmodule FaissEx.IndexTest do
   describe "file I/O error paths" do
     test "to_file into a nonexistent directory returns error" do
       {:ok, index} = Index.new(4, "Flat")
-      assert {:error, _} = Index.to_file(index, "/nonexistent_dir_faiss_ex/x.index")
+      assert {:error, msg} = Index.to_file(index, "/nonexistent_dir_faiss_ex/x.index")
+      assert msg =~ "could not open /nonexistent_dir_faiss_ex/x.index for writing"
     end
 
     test "from_file on a nonexistent path returns error" do
-      assert {:error, _} = Index.from_file("/nonexistent_dir_faiss_ex/missing.index")
+      assert {:error, msg} = Index.from_file("/nonexistent_dir_faiss_ex/missing.index")
+      assert msg =~ "could not open /nonexistent_dir_faiss_ex/missing.index for reading"
+    end
+
+    @tag :tmp_dir
+    test "from_file on a file that is not an index returns error", %{tmp_dir: tmp_dir} do
+      path = Path.join(tmp_dir, "corrupt.index")
+      File.write!(path, "not a faiss index at all")
+
+      assert {:error, msg} = Index.from_file(path)
+      assert msg =~ "not recognized"
+    end
+
+    @tag :tmp_dir
+    test "from_file with io_flags: 2 (read-only) round-trips", %{tmp_dir: tmp_dir} do
+      {:ok, index} = Index.new(4, "Flat")
+      :ok = Index.add(index, [[1.0, 2.0, 3.0, 4.0]])
+      path = Path.join(tmp_dir, "ro.index")
+      :ok = Index.to_file(index, path)
+
+      assert {:ok, loaded} = Index.from_file(path, io_flags: 2)
+      assert {:ok, %{labels: [[0]]}} = Index.search(loaded, [1.0, 2.0, 3.0, 4.0], 1)
+    end
+
+    test "non-binary path and non-integer io_flags are rejected" do
+      {:ok, index} = Index.new(4, "Flat")
+      assert {:error, "invalid arguments"} = Index.to_file(index, ~c"/x")
+      assert {:error, "invalid arguments"} = Index.from_file("/x.index", io_flags: :x)
+    end
+
+    test "unknown from_file options raise" do
+      assert_raise ArgumentError, ~r/unknown keys \[:io_flag\]/, fn ->
+        Index.from_file("/x.index", io_flag: 2)
+      end
     end
 
     @tag :tmp_dir
@@ -360,17 +393,6 @@ defmodule FaissEx.IndexTest do
       {:ok, index} = Index.new(4, "Flat")
       {:ok, %{labels: [labels_row]}} = Index.search(index, [0.0, 0.0, 0.0, 0.0], 3)
       assert labels_row == [-1, -1, -1]
-    end
-
-    test "search with n=0 returns empty results via NIF" do
-      {:ok, index} = Index.new(4, "Flat")
-      :ok = Index.add(index, [[1.0, 0.0, 0.0, 0.0]])
-
-      {:ok, {distances_bin, labels_bin}} =
-        FaissEx.NIF.nif_search_index(index.ref, 0, <<>>, 2)
-
-      assert byte_size(distances_bin) == 0
-      assert byte_size(labels_bin) == 0
     end
 
     test "adding after reset works" do
@@ -536,15 +558,18 @@ defmodule FaissEx.IndexTest do
       assert {:ok, 0} = Index.ntotal(index)
     end
 
-    test "add_with_ids with mismatched id count returns error" do
+    test "add_with_ids raises when the id count does not match the vector count" do
       {:ok, index} = Index.new(4, "IDMap,Flat")
 
-      assert {:error, "binary size mismatch"} =
-               Index.add_with_ids(
-                 index,
-                 [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
-                 [100]
-               )
+      assert_raise ArgumentError, "got 1 ids for 2 vectors, expected one id per vector", fn ->
+        Index.add_with_ids(index, [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], [100])
+      end
+
+      assert_raise ArgumentError, "got 1 ids for 0 vectors, expected one id per vector", fn ->
+        Index.add_with_ids(index, [], [1])
+      end
+
+      assert {:ok, 0} = Index.ntotal(index)
     end
 
     test "rejects non-positive dimension" do
@@ -672,12 +697,13 @@ defmodule FaissEx.IndexTest do
       assert {:ok, 0} = Index.ntotal(index)
     end
 
-    test "add_with_ids with mismatched binary sizes returns error" do
+    test "add_with_ids raises on mismatched binary sizes" do
       {:ok, index} = Index.new(4, "IDMap,Flat")
       vectors_bin = encode([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
 
-      assert {:error, "binary size mismatch"} =
-               Index.add_with_ids(index, vectors_bin, <<100::signed-native-64>>)
+      assert_raise ArgumentError, "got 1 ids for 2 vectors, expected one id per vector", fn ->
+        Index.add_with_ids(index, vectors_bin, <<100::signed-native-64>>)
+      end
     end
 
     test "search_binary on an empty query binary returns empty results" do
@@ -741,6 +767,275 @@ defmodule FaissEx.IndexTest do
       assert message =~ "ntotal"
     end
   end
+
+  describe "new/3 errors and options" do
+    test "a description FAISS cannot parse returns its message" do
+      assert {:error, msg} = Index.new(4, "NotAnIndex")
+      assert msg =~ "could not parse index string NotAnIndex"
+    end
+
+    test "a non-binary description is rejected" do
+      assert {:error, "invalid arguments"} = Index.new(4, ~c"Flat")
+    end
+
+    test "descriptions are capped at 256 bytes" do
+      assert {:error, "description too long"} = Index.new(4, String.duplicate("F", 257))
+
+      # 256 bytes passes the cap and reaches the factory parser
+      assert {:error, msg} = Index.new(4, String.duplicate("F", 256))
+      assert msg =~ "could not parse index string"
+    end
+
+    test "unknown options raise" do
+      assert_raise ArgumentError, ~r/unknown keys \[:metrc\]/, fn ->
+        Index.new(4, "Flat", metrc: :l2)
+      end
+    end
+
+    test "invalid devices raise before any index is created" do
+      for device <- [:gpu, {:cuda, -1}, {:cuda, 0.0}, :cuda] do
+        assert_raise ArgumentError, ~r/invalid device/, fn ->
+          Index.new(4, "Flat", device: device)
+        end
+      end
+    end
+
+    test "cpu_to_gpu rejects a negative device id" do
+      {:ok, index} = Index.new(4, "Flat")
+      assert_raise FunctionClauseError, fn -> Index.cpu_to_gpu(index, -1) end
+    end
+  end
+
+  describe "add_with_ids/3 on an index without id support" do
+    test "returns FAISS's error" do
+      {:ok, index} = Index.new(4, "Flat")
+      assert {:error, msg} = Index.add_with_ids(index, [[1.0, 0.0, 0.0, 0.0]], [7])
+      assert msg =~ "add_with_ids not implemented"
+      assert {:ok, 0} = Index.ntotal(index)
+    end
+  end
+
+  describe "search/3 contracts" do
+    setup do
+      {:ok, index} = Index.new(4, "Flat")
+      :ok = Index.add(index, [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+      %{index: index}
+    end
+
+    test "k must be a positive integer", %{index: index} do
+      query = [1.0, 0.0, 0.0, 0.0]
+      assert {:error, "k must be positive"} = Index.search(index, query, 0)
+      assert {:error, "k must be positive"} = Index.search_binary(index, encode([query]), 0)
+      assert {:error, "invalid arguments"} = Index.search(index, query, 1.5)
+    end
+
+    test "a k whose result size overflows is rejected before allocating", %{index: index} do
+      assert {:error, "size overflow"} =
+               Index.search(index, [1.0, 0.0, 0.0, 0.0], Integer.pow(2, 62))
+    end
+
+    test "queries of the wrong dimension raise", %{index: index} do
+      assert_raise ArgumentError, "row 0 has 3 elements, expected 4", fn ->
+        Index.search(index, [1.0, 0.0, 0.0], 1)
+      end
+
+      assert_raise ArgumentError, ~r/binary has 12 bytes, expected a multiple of 16/, fn ->
+        Index.search_binary(index, encode([[1.0, 0.0, 0.0]]), 1)
+      end
+    end
+
+    test "no queries return no rows", %{index: index} do
+      assert {:ok, %{distances: [], labels: []}} = Index.search(index, [], 3)
+    end
+
+    test "binary queries return decoded lists", %{index: index} do
+      queries = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+
+      assert {:ok, %{labels: [[0, 1], [1, 0]]} = from_binary} =
+               Index.search(index, encode(queries), 2)
+
+      assert {:ok, from_binary} == Index.search(index, queries, 2)
+    end
+  end
+
+  describe "train/2 contracts" do
+    test "IVF with fewer points than clusters returns FAISS's error" do
+      {:ok, index} = Index.new(4, "IVF4,Flat")
+      assert {:error, msg} = Index.train(index, [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+      assert msg =~ "Number of training points (2)"
+      assert {:ok, false} = Index.trained?(index)
+    end
+
+    test "an empty training set errors when training is required" do
+      {:ok, index} = Index.new(4, "IVF4,Flat")
+      assert {:error, msg} = Index.train(index, [])
+      assert msg =~ "Number of training points (0)"
+      assert {:ok, false} = Index.trained?(index)
+    end
+
+    test "an empty training set is a no-op when no training is needed" do
+      {:ok, index} = Index.new(4, "Flat")
+      assert :ok = Index.train(index, [])
+      assert :ok = Index.train(index, <<>>)
+    end
+
+    test "training data of the wrong dimension raises" do
+      {:ok, index} = Index.new(4, "IVF4,Flat")
+
+      assert_raise ArgumentError, "row 0 has 3 elements, expected 4", fn ->
+        Index.train(index, [[1.0, 0.0, 0.0]])
+      end
+    end
+  end
+
+  # Every case below aborted the whole VM before FAISS calls were kept out of
+  # OpenMP parallel regions (an exception inside one cannot reach the C API's
+  # catch): they must come back as error tuples.
+  describe "reconstruction errors never abort the VM" do
+    test "an index type without reconstruct" do
+      {:ok, index} = Index.new(4, "IDMap,Flat")
+      :ok = Index.add_with_ids(index, [[1.0, 0.0, 0.0, 0.0]], [7])
+
+      assert {:error, msg} = Index.reconstruct(index, [0])
+      assert msg =~ "reconstruct not implemented"
+      assert {:error, _} = Index.compute_residuals(index, [[1.0, 0.0, 0.0, 0.0]], [0])
+    end
+
+    test "an id map with a hole in a contiguous key run" do
+      {:ok, index} = Index.new(4, "IDMap2,Flat")
+      :ok = Index.add_with_ids(index, [[1.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0]], [10, 12])
+
+      assert {:error, _} = Index.reconstruct(index, [10, 11, 12])
+
+      assert Index.reconstruct(index, [12, 10]) ==
+               {:ok, [[2.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]}
+    end
+
+    test "more than 1000 contiguous keys past ntotal on a non-Flat index" do
+      {:ok, index} = Index.new(4, "HNSW32")
+      :ok = Index.add(index, for(i <- 0..1999, do: [i * 1.0, 0.0, 0.0, 0.0]))
+
+      assert {:error, _} = Index.reconstruct_binary(index, Enum.to_list(1500..2600))
+    end
+
+    test "a residual key past ntotal" do
+      {:ok, index} = Index.new(4, "Flat")
+      :ok = Index.add(index, [[1.0, 0.0, 0.0, 0.0]])
+
+      assert {:error, msg} = Index.compute_residuals(index, [[0.0, 0.0, 0.0, 0.0]], [5])
+      assert msg =~ "ntotal"
+    end
+
+    test "an IVF index without a direct map, non-contiguous keys" do
+      {:ok, index} = Index.new(4, "IVF2,Flat")
+      data = for i <- 0..99, do: [i * 1.0, 0.0, 0.0, 1.0]
+      :ok = Index.train(index, data)
+      :ok = Index.add(index, data)
+
+      assert {:error, msg} = Index.reconstruct(index, [5, 2])
+      assert is_binary(msg)
+
+      # Contiguous keys still take FAISS's batched path, which needs no
+      # direct map
+      assert Index.reconstruct(index, [2, 3]) ==
+               {:ok, [[2.0, 0.0, 0.0, 1.0], [3.0, 0.0, 0.0, 1.0]]}
+    end
+
+    test "no keys reconstruct no rows" do
+      {:ok, index} = Index.new(4, "Flat")
+      assert {:ok, []} = Index.reconstruct(index, [])
+    end
+  end
+
+  describe "compute_residuals contracts" do
+    setup do
+      {:ok, index} = Index.new(2, "Flat")
+      :ok = Index.add(index, [[1.0, 1.0], [2.0, 4.0], [-3.0, 0.5]])
+      %{index: index}
+    end
+
+    test "a batch equals xs minus the reconstructed keys", %{index: index} do
+      xs = [[0.0, 0.0], [10.0, 10.0], [1.0, -1.0]]
+      keys = [2, 0, 1]
+
+      {:ok, reconstructed} = Index.reconstruct(index, keys)
+
+      expected =
+        Enum.zip_with(xs, reconstructed, fn x, r -> Enum.zip_with(x, r, &(&1 - &2)) end)
+
+      assert {:ok, ^expected} = Index.compute_residuals(index, xs, keys)
+    end
+
+    test "binary inputs and the binary variant agree with lists", %{index: index} do
+      xs = [[0.0, 0.0], [10.0, 10.0], [1.0, -1.0]]
+      keys = [2, 0, 1]
+      {:ok, from_lists} = Index.compute_residuals(index, xs, keys)
+
+      assert {:ok, ^from_lists} = Index.compute_residuals(index, encode(xs), encode_ids(keys))
+      assert {:ok, bin} = Index.compute_residuals_binary(index, encode(xs), keys)
+      assert bin == encode(from_lists)
+    end
+
+    test "vectors of the wrong dimension raise", %{index: index} do
+      assert_raise ArgumentError, "row 0 has 3 elements, expected 2", fn ->
+        Index.compute_residuals(index, [[1.0, 2.0, 3.0]], [0])
+      end
+    end
+  end
+
+  describe "GPU calls on a non-CUDA build" do
+    @describetag :no_cuda
+
+    test "creating on a CUDA device reports the missing support" do
+      assert {:error, "GPU support not compiled"} = Index.new(4, "Flat", device: {:cuda, 0})
+    end
+
+    test "cpu_to_gpu with the default device reports the missing support" do
+      {:ok, index} = Index.new(4, "Flat")
+      assert {:error, "GPU support not compiled"} = Index.cpu_to_gpu(index)
+    end
+
+    test "gpu_to_cpu on a struct claiming a CUDA device reports the missing support" do
+      {:ok, %Index{} = index} = Index.new(4, "Flat")
+      forged = %Index{index | device: {:cuda, 0}}
+      assert {:error, "GPU support not compiled"} = Index.gpu_to_cpu(forged)
+    end
+
+    test "num_gpus is zero" do
+      assert FaissEx.num_gpus() == 0
+    end
+  end
+
+  describe "misaligned binary input" do
+    # binary_part/3 at offset 1 yields a sub-binary whose data pointer is
+    # misaligned for f32/s64; the NIF must copy it rather than hand FAISS a
+    # misaligned pointer, and results must match the aligned input.
+    setup do
+      vectors = for i <- 0..7, do: [i * 1.0, i * 2.0, 0.0, 1.0]
+      %{vectors: vectors, payload: encode(vectors)}
+    end
+
+    test "add, search_binary, and reconstruct_binary match aligned input", ctx do
+      {:ok, aligned} = Index.new(4, "Flat")
+      {:ok, misaligned} = Index.new(4, "Flat")
+
+      :ok = Index.add(aligned, ctx.payload)
+      :ok = Index.add(misaligned, misalign(ctx.payload))
+
+      queries = encode(Enum.take(ctx.vectors, 3))
+      {:ok, expected} = Index.search_binary(aligned, queries, 2)
+      assert {:ok, ^expected} = Index.search_binary(misaligned, misalign(queries), 2)
+
+      keys = encode_ids([5, 2, 7])
+      {:ok, expected_rows} = Index.reconstruct_binary(aligned, keys)
+      assert {:ok, ^expected_rows} = Index.reconstruct_binary(misaligned, misalign(keys))
+
+      assert expected_rows ==
+               encode([Enum.at(ctx.vectors, 5), Enum.at(ctx.vectors, 2), Enum.at(ctx.vectors, 7)])
+    end
+  end
+
+  defp misalign(bin), do: binary_part(<<0, bin::binary>>, 1, byte_size(bin))
 
   # Reference encoders, module-level so the scoping matches reality: `defp`
   # inside a `describe` compiles into the module regardless. Kept local rather

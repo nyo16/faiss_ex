@@ -26,6 +26,44 @@ defmodule FaissEx.Shared do
   end
 
   @doc false
+  # Vectors as lists or as a row-major f32-native binary. A binary passes
+  # through after a byte-size check; its row count is inferred.
+  @spec encode_vector_data!([number()] | [[number()]] | binary(), pos_integer()) ::
+          {non_neg_integer(), binary()}
+  def encode_vector_data!(data, dim) when is_list(data), do: encode_vectors!(data, dim)
+
+  def encode_vector_data!(data, dim) when is_binary(data) do
+    row_size = dim * 4
+
+    case rem(byte_size(data), row_size) do
+      0 ->
+        {div(byte_size(data), row_size), data}
+
+      _ ->
+        raise ArgumentError,
+              "binary has #{byte_size(data)} bytes, expected a multiple of " <>
+                "#{row_size} (dim #{dim} * 4 bytes per f32)"
+    end
+  end
+
+  @doc false
+  # IDs/keys as a list of integers or an s64-native binary.
+  @spec encode_id_data!([integer()] | binary()) :: {non_neg_integer(), binary()}
+  def encode_id_data!(ids) when is_list(ids), do: encode_ids!(ids)
+
+  def encode_id_data!(ids) when is_binary(ids) do
+    case rem(byte_size(ids), 8) do
+      0 ->
+        {div(byte_size(ids), 8), ids}
+
+      _ ->
+        raise ArgumentError,
+              "ids binary has #{byte_size(ids)} bytes, expected a multiple of " <>
+                "8 (one s64 per id)"
+    end
+  end
+
+  @doc false
   @spec binary_to_float_rows(binary(), pos_integer()) :: [[float()]]
   def binary_to_float_rows(bin, row_len)
       when is_binary(bin) and is_integer(row_len) and row_len > 0 do

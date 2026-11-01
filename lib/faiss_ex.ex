@@ -4,8 +4,9 @@ defmodule FaissEx do
   Facebook AI Similarity Search.
 
   FaissEx provides fast vector similarity search and clustering through
-  FAISS's C API. All data flows as plain Elixir lists — no external
-  dependencies beyond `elixir_make`.
+  FAISS's C API. Vectors are passed as plain Elixir lists, or as raw
+  `f32-native` binaries on the hot paths (see the *Binary API* section of
+  `FaissEx.Index`). No external dependencies beyond `elixir_make`.
 
   ## Quick start
 
