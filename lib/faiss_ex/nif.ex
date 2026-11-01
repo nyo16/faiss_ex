@@ -19,12 +19,12 @@ defmodule FaissEx.NIF do
   # surface as an opaque NIF load failure.
   defp omp_threads_config do
     case Application.get_env(:faiss_ex, :omp_threads, 0) do
-      n when is_integer(n) and n >= 0 and n <= 0x7FFFFFFF ->
+      n when is_integer(n) and n >= 0 and n <= 4096 ->
         n
 
       other ->
         raise ArgumentError,
-              "config :faiss_ex, omp_threads: expected a non-negative integer, got: #{inspect(other)}"
+              "config :faiss_ex, omp_threads: expected an integer in 0..4096, got: #{inspect(other)}"
     end
   end
 

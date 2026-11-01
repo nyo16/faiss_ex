@@ -16,9 +16,10 @@ before upgrading.
   `Index.from_file/2` raise `ArgumentError` (a typo like `metrc:` used to be
   ignored), and an invalid `:device` raises `ArgumentError` instead of
   `CaseClauseError`. `cpu_to_gpu/2` requires a non-negative integer device.
-- **`Index.train(index, [])` goes to FAISS**: still `:ok` for indexes that
-  need no training (Flat, HNSW), but now `{:error, reason}` for indexes that
-  do (IVF, PQ) — it used to return `:ok` without training anything.
+- **`Index.train(index, [])` reports untrained indexes**: still `:ok` for
+  indexes that are already trained (Flat, HNSW), but now
+  `{:error, "no training vectors"}` for indexes that need training (IVF, PQ,
+  PCA) — it used to return `:ok` without training anything.
 - **`Clustering.train/2` no longer mutates its input.** Each call builds a
   fresh FAISS clustering object and quantizer; the struct you pass in stays
   untrained and usable, and two trains from one struct are independent.
@@ -87,17 +88,23 @@ before upgrading.
 ### Security
 
 - `Index.from_file/2` documents its trust boundary: an on-disk IVF index
-  file can make the loader memory-map an arbitrary path it names. Use
-  `io_flags: 6` for untrusted files (flag table in the docs).
+  file can make the loader memory-map an arbitrary path it names, and
+  malformed files can still crash the VM — only load trusted files.
+  `io_flags` accepts only `0`, `2`, `4`, `6` (`8`, skip IVF data, produced
+  indexes that dereference unmapped memory). Index files with a
+  non-positive dimension are rejected (they corrupted the heap on
+  `reconstruct`).
 - Factory descriptions are documented as trusted input (they size
   allocations).
 - Build: `FAISS_GIT_REV`/`FAISS_GIT_REPO` are allow-listed (`https://`
-  only), recipe paths are quoted, and the pinned FAISS commit is
-  re-verified on every build, so a tampered warm cache fails closed.
-- CI: actions pinned by commit SHA with Dependabot, `contents: read`
+  only), `FAISS_GIT_SHA` must be a 40-character hex commit id, recipe
+  paths are quoted, and the pinned FAISS commit is re-verified on every
+  build, so a warm cache checked out at another commit fails closed.
+- CI: actions pinned by commit SHA and the CUDA container by digest,
+  Dependabot for actions and Hex deps (7-day cooldown), `contents: read`
   permissions, no persisted checkout credentials, job timeouts,
-  `mix hex.audit`, validated release tag versions, and a protected `hex`
-  environment for publishing.
+  `mix hex.audit`, and releases only from validated `v*` tags on commits
+  that are on master.
 
 ## v0.3.2 (2026-10-31)
 

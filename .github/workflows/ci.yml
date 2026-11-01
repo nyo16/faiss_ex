@@ -169,7 +169,8 @@ jobs:
     name: CUDA syntax check
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    container: nvidia/cuda:12.6.3-devel-ubuntu24.04
+    # 12.6.3-devel-ubuntu24.04, pinned by digest
+    container: nvidia/cuda@sha256:392c0df7b577ecae17a17f6ba7f2009c217bb4422f8431c053ae9af61a8c148a
     steps:
       - name: Install build dependencies
         run: apt-get update && apt-get install -y --no-install-recommends erlang-dev git gcc make ca-certificates

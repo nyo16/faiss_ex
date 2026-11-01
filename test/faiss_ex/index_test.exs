@@ -356,7 +356,28 @@ defmodule FaissEx.IndexTest do
     test "non-binary path and non-integer io_flags are rejected" do
       {:ok, index} = Index.new(4, "Flat")
       assert {:error, "invalid arguments"} = Index.to_file(index, ~c"/x")
-      assert {:error, "invalid arguments"} = Index.from_file("/x.index", io_flags: :x)
+
+      for flags <- [:x, 1, 8, 10] do
+        assert_raise ArgumentError, ~r/invalid io_flags/, fn ->
+          Index.from_file("/x.index", io_flags: flags)
+        end
+      end
+    end
+
+    @tag :tmp_dir
+    test "an index file claiming dimension 0 is rejected", %{tmp_dir: tmp_dir} do
+      # FAISS accepts an outer d = 0 for an ID map over a valid storage
+      # index; reconstruct on such an index then wrote past a 0-byte result
+      # buffer. (A plain Flat is caught by FAISS's own codes-size check.)
+      {:ok, index} = Index.new(4, "IDMap,Flat")
+      :ok = Index.add_with_ids(index, [[1.0, 2.0, 3.0, 4.0]], [1])
+      path = Path.join(tmp_dir, "d0.index")
+      :ok = Index.to_file(index, path)
+
+      <<header::binary-size(4), 4::little-signed-32, rest::binary>> = File.read!(path)
+      File.write!(path, <<header::binary, 0::little-signed-32, rest::binary>>)
+
+      assert {:error, "index file has a non-positive dimension"} = Index.from_file(path)
     end
 
     test "unknown from_file options raise" do
@@ -869,8 +890,18 @@ defmodule FaissEx.IndexTest do
     test "an empty training set errors when training is required" do
       {:ok, index} = Index.new(4, "IVF4,Flat")
       assert {:error, msg} = Index.train(index, [])
-      assert msg =~ "Number of training points (0)"
+      assert msg == "no training vectors"
       assert {:ok, false} = Index.trained?(index)
+    end
+
+    test "an empty training set never reaches a BLAS-backed trainer" do
+      # PCA hands n = 0 to cblas_ssyrk; macOS Accelerate's error handler
+      # exited the whole VM before the NIF stopped forwarding empty sets.
+      for desc <- ["PCA8,Flat", "PCAR8,SQ8"] do
+        {:ok, index} = Index.new(8, desc)
+        assert {:error, "no training vectors"} = Index.train(index, [])
+        assert {:error, "no training vectors"} = Index.train(index, <<>>)
+      end
     end
 
     test "an empty training set is a no-op when no training is needed" do

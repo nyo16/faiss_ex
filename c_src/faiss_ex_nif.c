@@ -280,7 +280,9 @@ static int acquire_write(ErlNifRWLock *lock, LockMode mode) {
  * FAISS_EX_NO_OMP (libfaiss linked against a runtime this NIF cannot
  * share, e.g. Intel iomp5), the setting is accepted and ignored. */
 static _Atomic int g_omp_threads = 0;
+#ifndef FAISS_EX_NO_OMP
 static int g_omp_default = 1;
+#endif
 
 static void apply_omp_threads(void) {
 #ifndef FAISS_EX_NO_OMP
@@ -387,6 +389,9 @@ static ERL_NIF_TERM nif_new_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     }
 
     if (dim <= 0) return make_error_msg(env, "dim must be positive");
+    if (metric != METRIC_L2 && metric != METRIC_INNER_PRODUCT) {
+        return make_error_msg(env, "invalid metric");
+    }
     if (contains_nul(&desc_bin)) return make_error_msg(env, "string contains NUL byte");
     if (desc_bin.size > MAX_DESCRIPTION_BYTES) return make_error_msg(env, "description too long");
 
@@ -598,9 +603,12 @@ static ERL_NIF_TERM nif_search_index_impl(ErlNifEnv *env, int argc, const ERL_NI
 
 /* nif_train_index(ref, n, data_binary)
  *
- * n == 0 goes to FAISS too: it decides whether an empty training set is an
- * error (IVF: fewer points than clusters) or a no-op (Flat, which needs no
- * training). aligned_input supplies a valid pointer for the empty input. */
+ * n == 0 never reaches FAISS: several trainers pass the empty set straight
+ * to BLAS (PCA, RQ, PRQ call cblas_ssyrk with LDC = 0), and macOS
+ * Accelerate's BLAS error handler exits the whole process — no C++
+ * exception, nothing to catch. Verified v1.15.1: train(PCA8,Flat, []) ->
+ * VM exit 255. An empty set is a no-op for an index that is already
+ * trained (Flat, HNSW) and an error for one that is not (IVF, PQ, PCA). */
 LOCKED_NIF(nif_train_index)
 static ERL_NIF_TERM nif_train_index_impl(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[],
                                          LockMode mode) {
@@ -618,6 +626,15 @@ static ERL_NIF_TERM nif_train_index_impl(ErlNifEnv *env, int argc, const ERL_NIF
     const char *err = check_rows(n, (size_t)res->dim, sizeof(float), &data_bin,
                                  "data binary size mismatch");
     if (err) return make_error_msg(env, err);
+
+    if (n == 0) {
+        if (!acquire_read(res->lock, mode)) {
+            return RESCHEDULE_BLOCKING(nif_train_index, env, argc, argv);
+        }
+        int trained = faiss_Index_is_trained(res->index);
+        enif_rwlock_runlock(res->lock);
+        return trained ? atom_ok : make_error_msg(env, "no training vectors");
+    }
 
     const void *data;
     void *owned;
@@ -907,6 +924,14 @@ static ERL_NIF_TERM nif_read_index(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 
     if (ret != 0) {
         return make_faiss_error(env, "failed to read index");
+    }
+
+    /* FAISS accepts d <= 0 from a file; every size computation here
+     * assumes d > 0 (a 0-byte reconstruct result would then take the
+     * 4-byte UNWRITTEN_ROW_TAG write). Reject such files outright. */
+    if (faiss_Index_d(index) <= 0) {
+        faiss_Index_free(index);
+        return make_error_msg(env, "index file has a non-positive dimension");
     }
 
     ERL_NIF_TERM ref;

@@ -52,9 +52,15 @@ defmodule FaissEx do
   Sets the number of OpenMP threads FAISS uses inside each call
   (search, add, train, reconstruct, residuals, clustering).
 
-  `0` restores the runtime default (`OMP_NUM_THREADS`, or the core count).
-  The setting is global, takes effect on the next FAISS call, and can also
-  be set at boot with `config :faiss_ex, omp_threads: n`.
+  `0` restores the runtime default (`OMP_NUM_THREADS`, or the core count);
+  the maximum is 4096. The setting is global and takes effect on the next
+  FAISS call.
+
+  To set it at boot, put `config :faiss_ex, omp_threads: n` in
+  `config/config.exs` (or `prod.exs`). It is read when the NIF loads, which
+  in a release happens *before* `config/runtime.exs` is evaluated, so a value
+  set only in `runtime.exs` has no effect — for runtime-derived values, call
+  this function from your application's `start/2`.
 
   ## Choosing a value
 
@@ -74,8 +80,8 @@ defmodule FaissEx do
   A NIF built without a shareable OpenMP runtime (a system FAISS linked
   against Intel's `libiomp5`) accepts and ignores the setting.
   """
-  @spec set_omp_threads(non_neg_integer()) :: :ok
-  def set_omp_threads(threads) when is_integer(threads) and threads >= 0 do
+  @spec set_omp_threads(0..4096) :: :ok
+  def set_omp_threads(threads) when is_integer(threads) and threads >= 0 and threads <= 4096 do
     :ok = FaissEx.NIF.nif_set_omp_threads(threads)
   end
 end

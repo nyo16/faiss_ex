@@ -9,3 +9,11 @@ updates:
     # Let a new release age a week before proposing it (supply-chain buffer)
     cooldown:
       default-days: 7
+
+  # Hex deps (mix.lock); `mix hex.audit` in CI catches retired versions
+  - package-ecosystem: mix
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
