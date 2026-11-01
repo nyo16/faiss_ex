@@ -13,6 +13,8 @@
 #include "c_api/index_io_c.h"
 #include "c_api/clone_index_c.h"
 #include "c_api/Clustering_c.h"
+#include "c_api/IndexFlat_c.h"
+#include "c_api/IndexIVF_c.h"
 #include "c_api/error_c.h"
 #include "c_api/faiss_c.h"
 
@@ -304,18 +306,37 @@ static char *dup_cstr(const ErlNifBinary *bin) {
     return s;
 }
 
-/* Rejects reconstruction keys that FAISS will not bounds-check.
+/* Rejects reconstruction keys that FAISS will not bounds-check safely.
  * IndexFlat::reconstruct tests only `key < ntotal`, which every negative key
  * passes, so a negative key reads before the codes array and returns heap
  * contents as vector data. Verified against v1.14.3 (reconstruct([-1, -5])
  * yields garbage floats with no error); the check is unchanged in v1.15.1.
- * The upper bound stays FAISS's job --
- * it needs ntotal, which needs the lock. */
-static int keys_non_negative(const idx_t *keys, ErlNifSInt64 n) {
+ * INT64_MAX is rejected too: IndexFlatCodes::reconstruct(key) is
+ * reconstruct_n(key, 1), whose `i0 + ni <= ntotal` signed-overflows there
+ * and passes. The upper bound stays FAISS's job -- it needs ntotal, which
+ * needs the lock. */
+static int keys_in_range(const idx_t *keys, ErlNifSInt64 n) {
     for (ErlNifSInt64 i = 0; i < n; i++) {
-        if (keys[i] < 0) return 0;
+        if (keys[i] < 0 || keys[i] == INT64_MAX) return 0;
     }
     return 1;
+}
+
+/* FAISS exceptions must never be thrown inside an OpenMP parallel region:
+ * they cannot cross the region boundary to the C API's try/catch, so the
+ * runtime calls std::terminate and the whole VM aborts. This holds even
+ * for a region serialized by an `if` clause. Index::reconstruct_n and
+ * Index::compute_residual_n (the base implementations) call reconstruct
+ * inside such a region, and reconstruct throws for a key past ntotal or an
+ * index type without it (IDMap). Verified v1.15.1: Flat
+ * compute_residuals([v], [5]) and IDMap reconstruct([0]) aborted the VM.
+ *
+ * Only IndexFlat (IndexFlatCodes) and IndexIVF override reconstruct_n with
+ * an up-front range check and no parallel region, so only they get the
+ * batched call, and only after the caller has checked the range against
+ * ntotal under the lock. Re-verify both overrides when bumping FAISS. */
+static int has_safe_reconstruct_n(FaissIndex *index) {
+    return faiss_IndexFlat_cast(index) != NULL || faiss_IndexIVF_cast(index) != NULL;
 }
 
 /* Wraps a FaissIndex in a resource with its own rwlock.
@@ -671,9 +692,10 @@ static ERL_NIF_TERM nif_reconstruct_batch_impl(ErlNifEnv *env, int argc, const E
     const idx_t *keys = (const idx_t *)keys_ptr;
 
     /* Contiguous ascending keys (the common case) can use the batched
-     * faiss_Index_reconstruct_n instead of one call per key. Unsigned
-     * arithmetic: keys are caller-controlled and keys[i-1] + 1 would be
-     * signed-overflow UB at INT64_MAX. */
+     * faiss_Index_reconstruct_n instead of one call per key; see
+     * has_safe_reconstruct_n for when that is allowed. Unsigned arithmetic:
+     * keys are caller-controlled and keys[i-1] + 1 would be signed-overflow
+     * UB at INT64_MAX. */
     int contiguous = 1;
     for (ErlNifSInt64 i = 1; i < n; i++) {
         if ((uint64_t)keys[i] != (uint64_t)keys[i - 1] + 1u) {
@@ -687,7 +709,7 @@ static ERL_NIF_TERM nif_reconstruct_batch_impl(ErlNifEnv *env, int argc, const E
      * INT64_MAX. No real index can hold such a range, so reject it rather
      * than hand FAISS a bound it computes as UB. */
     ErlNifBinary result_bin;
-    if (!keys_non_negative(keys, n) || (contiguous && keys[0] > INT64_MAX - n)) {
+    if (!keys_in_range(keys, n) || (contiguous && keys[0] > INT64_MAX - n)) {
         err = "key out of range";
     } else if (!enif_alloc_binary(result_size, &result_bin)) {
         err = "failed to allocate result binary";
@@ -699,6 +721,7 @@ static ERL_NIF_TERM nif_reconstruct_batch_impl(ErlNifEnv *env, int argc, const E
 
     float *result = (float *)result_bin.data;
     int dim = res->dim;
+    int batched = contiguous && has_safe_reconstruct_n(res->index);
     int ret = 0;
 
     apply_omp_threads();
@@ -707,9 +730,11 @@ static ERL_NIF_TERM nif_reconstruct_batch_impl(ErlNifEnv *env, int argc, const E
         enif_release_binary(&result_bin);
         return RESCHEDULE_BLOCKING(nif_reconstruct_batch, env, argc, argv);
     }
-    if (contiguous) {
+    if (batched && keys[0] + n <= faiss_Index_ntotal(res->index)) {
         ret = faiss_Index_reconstruct_n(res->index, keys[0], (idx_t)n, result);
     } else {
+        /* One guarded call per key, outside any parallel region: a key
+         * FAISS rejects becomes an error return, never an abort. */
         for (ErlNifSInt64 i = 0; i < n; i++) {
             ret = faiss_Index_reconstruct(res->index, keys[i], result + i * dim);
             if (ret != 0) break;
@@ -764,7 +789,7 @@ static ERL_NIF_TERM nif_compute_residuals_impl(ErlNifEnv *env, int argc, const E
     const idx_t *keys = (const idx_t *)keys_ptr;
 
     ErlNifBinary result_bin;
-    if (!keys_non_negative(keys, n)) {
+    if (!keys_in_range(keys, n)) {
         err = "key out of range";
     } else if (!enif_alloc_binary(data_bin.size, &result_bin)) {
         err = "failed to allocate result binary";
@@ -782,8 +807,17 @@ static ERL_NIF_TERM nif_compute_residuals_impl(ErlNifEnv *env, int argc, const E
         enif_release_binary(&result_bin);
         return RESCHEDULE_BLOCKING(nif_compute_residuals, env, argc, argv);
     }
-    int ret = faiss_Index_compute_residual_n(res->index, (idx_t)n, (const float *)data,
-                                             (float *)result_bin.data, keys);
+    /* Not faiss_Index_compute_residual_n: Index::compute_residual_n runs in
+     * an OpenMP region and aborts the VM on any key FAISS rejects (see
+     * has_safe_reconstruct_n). One guarded call per vector instead. */
+    const float *xs = (const float *)data;
+    float *residuals = (float *)result_bin.data;
+    int dim = res->dim;
+    int ret = 0;
+    for (ErlNifSInt64 i = 0; i < n; i++) {
+        ret = faiss_Index_compute_residual(res->index, xs + i * dim, residuals + i * dim, keys[i]);
+        if (ret != 0) break;
+    }
     enif_rwlock_runlock(res->lock);
     free_owned(owned_data);
     free_owned(owned_keys);
